@@ -1,17 +1,24 @@
 use std::env;
 
-#[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    // If encoded_value starts with a digit, it's a number
-    if encoded_value.chars().next().unwrap().is_ascii_digit() {
-        // Example: "5:hello" -> "hello"
-        let colon_index = encoded_value.find(':').unwrap();
+    let first_char = encoded_value.chars().next().unwrap();
+    if first_char == 'i' {
+        let e_index = encoded_value .find('e')
+            .unwrap_or_else(|| panic!("No e in bencoded integer: {encoded_value}"));
+        let number_string = &encoded_value[1..e_index];
+        let number = number_string.parse::<i128>()
+            .unwrap_or_else(|_| panic!("Invalid number in bencoded integer: {number_string}"));
+        serde_json::Value::Number(serde_json::Number::from_i128(number).unwrap())
+    } else if first_char.is_ascii_digit() {
+        let colon_index = encoded_value .find(':')
+            .unwrap_or_else(|| panic!("No colon in bencoded string: {encoded_value}"));
         let number_string = &encoded_value[..colon_index];
-        let number = number_string.parse::<usize>().unwrap();
+        let number = number_string.parse::<usize>()
+            .unwrap_or_else(|_| panic!("Invalid length in bencoded string: {number_string}"));
         let string = &encoded_value[colon_index + 1..colon_index + 1 + number];
         serde_json::Value::String(string.to_string())
     } else {
-        panic!("Unhandled encoded value: {}", encoded_value)
+        panic!("Unhandled bencoded value: {}", encoded_value)
     }
 }
 
@@ -20,8 +27,7 @@ fn main() {
     let command = &args[1];
 
     if command == "decode" {
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        eprintln!("Logs from your program will appear here!");
+        // eprintln!("Logs from your program will appear here!");
 
         let encoded_value = &args[2];
         let decoded_value = decode_bencoded_value(encoded_value);
