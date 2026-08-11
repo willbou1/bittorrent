@@ -5,10 +5,11 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     if first_char == 'i' {
         let e_index = encoded_value .find('e')
             .unwrap_or_else(|| panic!("No e in bencoded integer: {encoded_value}"));
-        let number_string = &encoded_value[1..e_index];
-        let number = number_string.parse::<i128>()
-            .unwrap_or_else(|_| panic!("Invalid number in bencoded integer: {number_string}"));
-        serde_json::Value::Number(serde_json::Number::from_i128(number).unwrap())
+        let integer_string = &encoded_value[1..e_index];
+        let integer = integer_string.parse::<i128>()
+            .unwrap_or_else(|_| panic!("Invalid number in bencoded integer: {integer_string}"));
+        let number = serde_json::Number::from_i128(integer).unwrap();
+        serde_json::Value::Number(number)
     } else if first_char.is_ascii_digit() {
         let colon_index = encoded_value .find(':')
             .unwrap_or_else(|| panic!("No colon in bencoded string: {encoded_value}"));
