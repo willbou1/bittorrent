@@ -1,30 +1,60 @@
 mod bencode;
 mod metainfo;
+mod tracker;
+mod peer;
 
 use bencode::BencodeValue;
 use metainfo::Metainfo;
+use peer::{Peer, Message};
 
-use std::{env,fs};
-
+use std::sync::Arc;
+use std::{env,fs, range};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let command = &args[1];
+    let second = &args[2];
 
-    if command == "decode" {
-        // eprintln!("Logs from your program will appear here!");
+    match command.as_str() {
+        "init" | "info" => {
+            let torrent = fs::read(second).unwrap();
+            let metainfo = Arc::new(Metainfo::from_bytes(&torrent).unwrap());
+            let tracker_response = tracker::tracker_request(
+                &metainfo.announces[0][0],
+                &metainfo.info_hash, 0, 0, 100,
+                tracker::Event::started
+            ).unwrap();
+            println!("{}\n", metainfo);
+            println!("{}\n", tracker_response);
 
-        let encoded_value = &args[2];
-        let decoded_value = BencodeValue::from_bytes(encoded_value.as_bytes()).unwrap_or_else(
-            |e| panic!("{e}")
-        );
-        println!("{:?}", decoded_value.0.unwrap());
-    } else if command == "info" {
-        let torrent_path = &args[2];
-        let torrent = fs::read(torrent_path).unwrap();
-        let metainfo = Metainfo::from_bytes(&torrent);
-        println!("{}", metainfo.unwrap());
-    } else {
-        println!("unknown command: {}", args[1])
+            if command == "init" {
+                let peer_info = &tracker_response.peers[0];
+                let mut peer = Peer::from_info(
+                    peer_info,
+                    metainfo.clone(),
+                    b"00000000000000000000"
+                ).unwrap();
+                let rec = peer.receive().unwrap();
+                peer.handle_message(rec).unwrap();
+                peer.send(&Message::Interested(true)).unwrap();
+                let rec = peer.receive().unwrap();
+                peer.handle_message(rec).unwrap();
+                for p in 0..metainfo.num_pieces() {
+                    peer.request_block(p, 0).unwrap();
+                    let rec = peer.receive().unwrap();
+                    peer.handle_message(rec).unwrap();
+                    peer.request_block(p, 1).unwrap();
+                    let rec = peer.receive().unwrap();
+                    peer.handle_message(rec).unwrap();
+                }
+            }
+        }
+        "decode" => {
+            let decoded_value = BencodeValue::from_bytes(second.as_bytes()).unwrap_or_else(
+                |e| panic!("{e}")
+            );
+            println!("{:?}", decoded_value.0.unwrap());
+        }
+        _ => println!("unknown command: {}", args[1]),
     }
 }

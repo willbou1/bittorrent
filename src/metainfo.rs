@@ -4,8 +4,8 @@ use std::fmt;
 use crate::bencode::BencodeValue;
 
 pub struct MetainfoFile {
-    path: Vec<String>,
-    length: usize,
+    pub path: Vec<String>,
+    pub length: usize,
 }
 
 pub enum MetainfoMode {
@@ -14,13 +14,13 @@ pub enum MetainfoMode {
 }
 
 pub struct Metainfo {
-    announces: Vec<Vec<String>>,
-    created_by: Option<String>,
-    name: String,
-    piece_length: usize,
-    pieces: Vec<[u8; 20]>,
-    mode: MetainfoMode,
-    info_hash: [u8; 20],
+    pub announces: Vec<Vec<String>>,
+    pub created_by: Option<String>,
+    pub name: String,
+    pub piece_length: usize,
+    pub pieces: Vec<[u8; 20]>,
+    pub mode: MetainfoMode,
+    pub info_hash: [u8; 20],
 }
 
 impl MetainfoMode {
@@ -30,7 +30,7 @@ impl MetainfoMode {
             (Some(length), _) => Ok(Self::SingleFile(
                 MetainfoFile {
                     path: Vec::new(),
-                    length: length.length("length")?,
+                    length: length.unsigned("length")? as usize,
                 }
             )),
             (_, Some(files)) => Ok(Self::MultiFile(
@@ -41,7 +41,7 @@ impl MetainfoMode {
                     .map(|file| {
                         Ok(MetainfoFile {
                             path: file.required_string_list("path")?,
-                            length: file.required_length("length")?,
+                            length: file.required_unsigned("length")? as usize,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?
@@ -72,12 +72,31 @@ impl Metainfo {
             },
             created_by: root.optional_string("created by")?,
             name: info.required_string("name")?,
-            piece_length: info.required_length("piece length")?,
+            piece_length: info.required_unsigned("piece length")? as usize,
             pieces: info.required_bytes("pieces")?
                 .chunks(20).map(|chunk| chunk.try_into().unwrap())
                 .collect(),
             mode: MetainfoMode::from_bencode(&info)?,
         })
+    }
+
+    pub fn num_pieces(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub fn length(&self) -> usize {
+        match &self.mode {
+            MetainfoMode::SingleFile(file) => {
+                file.length
+            }
+            MetainfoMode::MultiFile(files) => {
+                files.iter().fold(0, |a, e| e.length + a)
+            }
+        }
+    }
+
+    pub fn last_piece_length(&self) -> usize {
+        self.length() - self.piece_length * (self.num_pieces() - 1)
     }
 }
 

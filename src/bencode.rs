@@ -255,13 +255,21 @@ impl BencodeValue {
         }
     }
 
-    pub fn length(&self, name: &str) -> Result<usize, String> {
+    pub fn unsigned(&self, name: &str) -> Result<u64, String> {
         self .as_i64().ok_or_else(|| format!("'{name}' must be an integer"))
-            .map(|s| s as usize)
+            .map(|s| s as u64)
     }
 
-    pub fn required_length(&self, key: &str) -> Result<usize, String> {
-        self.required(key)?.length(key)
+    pub fn required_unsigned(&self, key: &str) -> Result<u64, String> {
+        self.required(key)?.unsigned(key)
+    }
+
+    pub fn optional_unsigned(&self, key: &str) -> Result<Option<u64>, String> {
+        match self.get(key) {
+            Some(integer) => integer.unsigned(key)
+                .map(|s| Some(s)),
+            None => Ok(None),
+        }
     }
 
     pub fn string_list(&self, name: &str) -> Result<Vec<String>, String> {
