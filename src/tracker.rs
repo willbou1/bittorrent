@@ -1,22 +1,21 @@
 use reqwest::Url;
 use anyhow::Result;
-use std::io::Read;
 use std::fmt;
 
 use crate::bencode::BencodeValue;
 
 pub enum Event {
-    started,
-    completed,
-    stopped,
+    Started,
+    Completed,
+    Stopped,
 }
 
 impl Event {
     fn to_string(&self) -> &str {
         match self {
-            Self::started => "started",
-            Self::stopped => "stopped",
-            Self::completed => "completed",
+            Self::Started => "started",
+            Self::Stopped => "stopped",
+            Self::Completed => "completed",
         }
     }
 }
@@ -81,7 +80,7 @@ impl Response {
     }
 }
 
-pub fn tracker_request(
+pub async fn tracker_request(
     url: &str,
     info_hash: &[u8; 20],
     uploaded: usize,
@@ -106,9 +105,8 @@ pub fn tracker_request(
 
     let url = format!("{url}&info_hash={info_hash}");
 
-    let mut res = reqwest::blocking::get(url)?;
-    let mut body = vec![];
-    res.read_to_end(&mut body)?;
+    let res = reqwest::get(url).await?;
+    let body = res.bytes().await?;
     let response = Response::from_bytes(&body)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
