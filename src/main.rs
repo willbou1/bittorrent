@@ -24,8 +24,8 @@ fn main() {
                 &metainfo.info_hash, 0, 0, 100,
                 tracker::Event::started
             ).unwrap();
-            println!("{}\n", metainfo);
-            println!("{}\n", tracker_response);
+            println!("{}", metainfo);
+            println!("{}", tracker_response);
 
             if command == "init" {
                 let peer_info = &tracker_response.peers[0];
@@ -36,16 +36,17 @@ fn main() {
                 ).unwrap();
                 let rec = peer.receive().unwrap();
                 peer.handle_message(rec).unwrap();
-                peer.send(&Message::Interested(true)).unwrap();
+                peer.send(Message::Interested(true)).unwrap();
                 let rec = peer.receive().unwrap();
                 peer.handle_message(rec).unwrap();
-                for p in 0..metainfo.num_pieces() {
-                    peer.request_block(p, 0).unwrap();
-                    let rec = peer.receive().unwrap();
-                    peer.handle_message(rec).unwrap();
-                    peer.request_block(p, 1).unwrap();
-                    let rec = peer.receive().unwrap();
-                    peer.handle_message(rec).unwrap();
+                for p in 0..metainfo.num_pieces {
+                    let num_blocks = metainfo.piece_length(p).div_ceil(1024 * 16);
+                    for b in 0..num_blocks {
+                        peer.request_block(p, b).unwrap();
+                        let rec = peer.receive().unwrap();
+                        peer.handle_message(rec).unwrap();
+                    }
+                    peer.verify_piece(p).unwrap();
                 }
             }
         }

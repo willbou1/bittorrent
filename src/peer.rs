@@ -1,11 +1,15 @@
 use anyhow::Result;
+use sha1::{Sha1, Digest};
 use std::net::TcpStream;
 use std::io::prelude::*;
 use std::collections::{HashMap, hash_map};
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::fs;
+use std::path::{Path};
 
 use crate::tracker::PeerInfo;
-use crate::metainfo::Metainfo;
+use crate::metainfo::{Metainfo, MetainfoFile};
 
 const BLOCK_SIZE: usize = 16 * 1024;
 
@@ -60,20 +64,20 @@ pub enum Message {
     Choked(bool),
     Interested(bool),
     Bitfield(PieceBitfield),
-    Have(u32),
+    Have(usize),
     Request {
-        index: u32,
-        begin: u32,
-        length: u32,
+        index: usize,
+        begin: usize,
+        length: usize,
     },
     Cancel {
-        index: u32,
-        begin: u32,
-        length: u32,
+        index: usize,
+        begin: usize,
+        length: usize,
     },
     Piece {
-        index: u32,
-        begin: u32,
+        index: usize,
+        begin: usize,
         piece: Vec<u8>,
     },
 }
@@ -82,7 +86,7 @@ pub struct Peer {
     pub choked: bool,
     pub interested: bool,
     pub stream: TcpStream,
-    pub pieces: PieceBitfield,
+    pub piece_bitfield: PieceBitfield,
     pub blocks: HashMap<(usize, usize), Vec<u8>>,
     pub metainfo: Arc<Metainfo>,
     pub name: String,
@@ -133,31 +137,70 @@ impl Peer {
         }
         println!("{}: Received handshake", name);
 
-        let num_pieces = metainfo.num_pieces();
+        let num_pieces = metainfo.num_pieces;
         Ok(Self {
             stream,
             metainfo: metainfo,
             name,
             choked: true,
             interested: false,
-            pieces: PieceBitfield::new(num_pieces),
+            piece_bitfield: PieceBitfield::new(num_pieces),
             blocks: HashMap::new(),
         })
     }
 
+    pub fn assemble_piece(&mut self, index: usize) -> Vec<u8> {
+        let piece_length = self.metainfo.piece_length(index);
+        let mut piece = vec![0; piece_length];
+        for (key, val) in self.blocks.extract_if(|(p, _), _| *p == index) {
+            let begin = BLOCK_SIZE * key.1;
+            piece[begin..begin + val.len()].copy_from_slice(&val);
+        }
+        println!("{}: Assembled piece {}", self.name, index);
+        piece
+    }
+
+    pub fn verify_piece(&mut self, index: usize) -> Result<()> {
+        let piece = self.assemble_piece(index);
+        let hash = Sha1::digest(&piece);
+        let correct = hash == self.metainfo.pieces[index].into();
+        println!("{}: Verified piece {} to be {}", self.name, index,
+            if correct {"correct"} else {"incorrect"});
+        if correct {
+            self.write_piece(index, piece)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_piece(&self, index: usize, piece: Vec<u8>) -> Result<()> {
+        for piece_file in &self.metainfo.piece_files[index] {
+            let metainfo_file = &self.metainfo.files[piece_file.file_index];
+            let path = Path::new("torrents").join(&metainfo_file.path);
+            fs::create_dir_all(&path.parent().unwrap())?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)?;
+            file.set_len(metainfo_file.length as u64)?;
+            file.write_all_at(
+                &piece[piece_file.piece_offset..(piece_file.piece_offset + piece_file.length)],
+                piece_file.file_offset as u64
+            )?;
+            println!("{}: Wrote piece {} to {}", self.name, index, &path.to_string_lossy());
+        }
+        Ok(())
+    }
+
     pub fn request_block(&mut self, piece_index: usize, block_index: usize) -> Result<()> {
         anyhow::ensure!(
-            piece_index < self.metainfo.num_pieces(),
+            piece_index < self.metainfo.num_pieces,
             "piece index {} out of range ({} pieces)",
             piece_index,
-            self.metainfo.num_pieces(),
+            self.metainfo.num_pieces,
         );
 
-        let piece_length = if piece_index == self.metainfo.num_pieces() - 1 {
-            self.metainfo.last_piece_length()
-        } else {
-            self.metainfo.piece_length
-        };
+        let piece_length = self.metainfo.piece_length(piece_index);
 
         let num_blocks = piece_length.div_ceil(BLOCK_SIZE);
         anyhow::ensure!(
@@ -169,14 +212,14 @@ impl Peer {
 
         let begin = BLOCK_SIZE * block_index;
         let length = (piece_length - begin).min(BLOCK_SIZE);
-        self.send(&Message::Request {
-            index: piece_index as u32,
-            begin: begin as u32,
-            length: length as u32,
+        self.send(Message::Request {
+            index: piece_index,
+            begin: begin,
+            length: length,
         })
     }
 
-    pub fn send(&mut self, message: &Message) -> Result<()> {
+    pub fn send(&mut self, message: Message) -> Result<()> {
         let mut log = String::new();
         let mut payload = Vec::new();
 
@@ -187,13 +230,13 @@ impl Peer {
             }
             Message::Have(have) => {
                 payload.push(4);
-                payload.extend(have.to_be_bytes());
+                payload.extend((have as u32).to_be_bytes());
             }
             Message::Request{ index, begin, length } => {
                 payload.push(6);
-                payload.extend(index.to_be_bytes());
-                payload.extend(begin.to_be_bytes());
-                payload.extend(length.to_be_bytes());
+                payload.extend((index as u32).to_be_bytes());
+                payload.extend((begin as u32).to_be_bytes());
+                payload.extend((length as u32).to_be_bytes());
                 log = format!(
                     "{}: Sent request {{index: {}, begin: {}, length: {}}}",
                     self.name, index, begin, length
@@ -201,9 +244,9 @@ impl Peer {
             }
             Message::Cancel{ index, begin, length } => {
                 payload.push(8);
-                payload.extend(index.to_be_bytes());
-                payload.extend(begin.to_be_bytes());
-                payload.extend(length.to_be_bytes());
+                payload.extend((index as u32).to_be_bytes());
+                payload.extend((begin as u32).to_be_bytes());
+                payload.extend((length as u32).to_be_bytes());
                 log = format!(
                     "{}: Sent cancel {{index: {}, begin: {}, length: {}}}",
                     self.name, index, begin, length
@@ -211,16 +254,16 @@ impl Peer {
             }
             Message::Piece{ index, begin, piece } => {
                 payload.push(7);
-                payload.extend(index.to_be_bytes());
-                payload.extend(begin.to_be_bytes());
+                payload.extend((index as u32).to_be_bytes());
+                payload.extend((begin as u32).to_be_bytes());
                 payload.extend(piece);
             }
             Message::Choked(choked) => {
-                payload.push(if *choked {0} else {1});
+                payload.push(if choked {0} else {1});
                 log = format!("{}: Sent choke of {choked}", self.name);
             }
             Message::Interested(interested) => {
-                payload.push(if *interested {2} else {3});
+                payload.push(if interested {2} else {3});
                 log = format!("{}: Sent interest of {interested}", self.name);
             }
 
@@ -238,35 +281,31 @@ impl Peer {
         match message {
             Message::Bitfield(bitfield) => {
                 anyhow::ensure!(
-                    bitfield.num_bytes() == self.pieces.num_bytes(),
+                    bitfield.num_bytes() == self.piece_bitfield.num_bytes(),
                     "The received bitfield should be {} bytes long, got {}",
-                    self.pieces.num_bytes(), bitfield.num_bytes()
+                    self.piece_bitfield.num_bytes(), bitfield.num_bytes()
                 );
-                self.pieces.set_bytes(bitfield.as_bytes());
+                self.piece_bitfield.set_bytes(bitfield.as_bytes());
             }
             Message::Have(index) => {
-                let index = index as usize;
                 anyhow::ensure!(
-                    index < self.metainfo.num_pieces(),
+                    index < self.metainfo.num_pieces,
                     "The index of have leads outside the number of pieces, got {}",
                     index
                 );
-                self.pieces.set_piece(index);
+                self.piece_bitfield.set_piece(index);
             }
             Message::Request { index, begin, length } => {
-                let index = index as usize;
                 anyhow::ensure!(
-                    index < self.metainfo.num_pieces(),
+                    index < self.metainfo.num_pieces,
                     "The index of request leads outside the number of pieces, got {}",
                     index
                 );
                 // TODO let's queue that later
             }
             Message::Piece { index, begin, piece } => {
-                let index = index as usize;
-                let begin = begin as usize;
                 anyhow::ensure!(
-                    index < self.metainfo.num_pieces(),
+                    index < self.metainfo.num_pieces,
                     "The index of piece leads outside the number of pieces, got {}",
                     index
                 );
@@ -276,7 +315,6 @@ impl Peer {
                     begin
                 );
                 let block_index = begin / BLOCK_SIZE;
-                let piece_length = piece.len();
                 self.blocks.insert((index, block_index), piece);
             }
 
@@ -316,7 +354,7 @@ impl Peer {
                     format!("The length of an have payloud should be 5, got {message_length}")
                 );
                 self.stream.read_exact(&mut int_buf)?;
-                let index = u32::from_be_bytes(int_buf);
+                let index = u32::from_be_bytes(int_buf) as usize;
                 println!("{}: Received have {:?}", self.name, index);
                 Ok(Message::Have(index))
             }
@@ -326,11 +364,11 @@ impl Peer {
                     format!("The length of a request payloud should be 13, got {message_length}")
                 );
                 self.stream.read_exact(&mut int_buf)?;
-                let index = u32::from_be_bytes(int_buf);
+                let index = u32::from_be_bytes(int_buf) as usize;
                 self.stream.read_exact(&mut int_buf)?;
-                let begin = u32::from_be_bytes(int_buf);
+                let begin = u32::from_be_bytes(int_buf) as usize;
                 self.stream.read_exact(&mut int_buf)?;
-                let length = u32::from_be_bytes(int_buf);
+                let length = u32::from_be_bytes(int_buf) as usize;
                 eprintln!(
                     "{}: Received request {{index: {}, begin: {}, length: {}}}",
                     self.name, index, begin, length
@@ -340,12 +378,12 @@ impl Peer {
             7 => { // piece
                 anyhow::ensure!(
                     message_length > 1 + 4 + 4,
-                    format!("The length of a cancel payloud should be at least 10, got {message_length}")
+                    format!("The length of a piece payloud should be at least 10, got {message_length}")
                 );
                 self.stream.read_exact(&mut int_buf)?;
-                let index = u32::from_be_bytes(int_buf);
+                let index = u32::from_be_bytes(int_buf) as usize;
                 self.stream.read_exact(&mut int_buf)?;
-                let begin = u32::from_be_bytes(int_buf);
+                let begin = u32::from_be_bytes(int_buf) as usize;
                 let mut piece = vec![0u8; message_length - 1 - 4 - 4];
                 self.stream.read_exact(&mut piece)?;
                 eprintln!(
@@ -360,11 +398,11 @@ impl Peer {
                     format!("The length of a cancel payloud should be 13, got {message_length}")
                 );
                 self.stream.read_exact(&mut int_buf)?;
-                let index = u32::from_be_bytes(int_buf);
+                let index = u32::from_be_bytes(int_buf) as usize;
                 self.stream.read_exact(&mut int_buf)?;
-                let begin = u32::from_be_bytes(int_buf);
+                let begin = u32::from_be_bytes(int_buf) as usize;
                 self.stream.read_exact(&mut int_buf)?;
-                let length = u32::from_be_bytes(int_buf);
+                let length = u32::from_be_bytes(int_buf) as usize;
                 eprintln!(
                     "{}: Received cancel {{index: {}, begin: {}, length: {}}}",
                     self.name, index, begin, length

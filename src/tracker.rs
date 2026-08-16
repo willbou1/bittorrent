@@ -143,7 +143,7 @@ impl fmt::Display for Response {
         }
         writeln!(f, "Peers:")?;
         for peer in &self.peers {
-            writeln!(f, "{}", peer)?;
+            writeln!(f, "    {}", peer)?;
         }
         Ok(())
     }
