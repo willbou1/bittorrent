@@ -105,7 +105,6 @@ impl Metainfo {
             }
             piece_files.push(files_for_piece);
         }
-        println!("{piece_files:?}");
 
         Ok(Metainfo {
             info_hash: Sha1::digest(info.to_bytes()).into(),

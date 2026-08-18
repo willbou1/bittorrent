@@ -3,16 +3,26 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
+use tracing::info;
 
-use crate::tracker::PeerInfo;
-use crate::bitfield::PieceBitfield;
+use crate::{
+    tracker::PeerInfo,
+    bitfield::PieceBitfield,
+    torrent::{Event},
+};
 
+#[derive(Debug)]
 pub enum Message {
     KeepAlive,
     Choked(bool),
     Interested(bool),
     Bitfield(PieceBitfield),
     Have(usize),
+    Reject {
+        index: usize,
+        begin: usize,
+        length: usize,
+    },
     Request {
         index: usize,
         begin: usize,
@@ -28,17 +38,15 @@ pub enum Message {
         begin: usize,
         piece: Vec<u8>,
     },
+    Unsupported,
 }
 
 pub type PeerId = [u8; 20];
-type TorrentMessage = (PeerId, Message);
 
 pub struct Peer {
     pub stream: TcpStream,
     pub name: String,
     pub id: PeerId,
-    tx: mpsc::Sender<TorrentMessage>,
-    rx: mpsc::Receiver<Message>,
 }
 
 impl Peer {
@@ -46,8 +54,6 @@ impl Peer {
         peer_info: &PeerInfo,
         info_hash: &[u8; 20],
         local_id: &PeerId,
-        tx: mpsc::Sender<TorrentMessage>,
-        rx: mpsc::Receiver<Message>,
     ) -> Result<Self> {
         let mut handshake = [0u8; 68];
         let name = format!("{peer_info}");
@@ -55,7 +61,7 @@ impl Peer {
         let mut stream = TcpStream::connect(
             format!("{}:{}", peer_info.host, peer_info.port)
         ).await?;
-        println!("{}: Connected", name);
+        info!(peer = %name, "Connected");
 
         // Send the handshake
         handshake[0] = 19;
@@ -64,7 +70,7 @@ impl Peer {
         handshake[28..48].copy_from_slice(info_hash);
         handshake[48..68].copy_from_slice(local_id);
         stream.write_all(&handshake).await?;
-        println!("{}: Sent handshake", name);
+        info!(peer = %name, "Sent handshake");
 
         // Receive the handshake response and verify it is right
         stream.read_exact(&mut handshake).await?;
@@ -86,24 +92,24 @@ impl Peer {
                 "expected handshake response to have right peer id"
             );
         }
-        println!("{}: Received handshake", name);
+        info!(peer = %name, "Received handshake");
 
         Ok(Self {
             stream,
             name,
             id: handshake[48..68].try_into()?,
-            tx,
-            rx,
         })
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(
+        self,
+        tx: mpsc::Sender<Event>,
+        mut rx: mpsc::Receiver<Message>,
+    ) -> Result<()> {
         let Peer {
             stream,
             name,
             id,
-            tx,
-            mut rx,
         } = self;
         let (mut reader, mut writer) = stream.into_split();
 
@@ -111,14 +117,26 @@ impl Peer {
             tokio::select! {
                 message = rx.recv() => {
                     match message {
-                        Some(message) => send(&mut writer, &name, message).await?,
+                        Some(message) => {
+                            if let Err(e) = send(&mut writer, &name, message).await {
+                                let _ = tx.send(Event::PeerDisconnection(id)).await;
+                                return Err(e.into());
+                            }
+                        }
                         None => return Ok(()),
                     }
                 }
-
+                
                 result = receive(&mut reader, &name) => {
-                    let message = result?;
-                    tx.send((id, message)).await?;
+                    match result {
+                        Ok(message) => {
+                            tx.send(Event::PeerMessage(id, message)).await?;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::PeerDisconnection(id)).await;
+                            return Err(e.into());
+                        }
+                    }
                 }
             }
         }
@@ -138,19 +156,20 @@ async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Resu
         Message::Bitfield(bitfield) => {
             payload.push(5);
             payload.extend(bitfield.as_bytes());
+            log = format!("Sent bitfield {:?}", bitfield.as_bytes());
         }
         Message::Have(have) => {
             payload.push(4);
             payload.extend((have as u32).to_be_bytes());
-            log = format!("{name}: Sent have {have}");
+            log = format!("Sent have {have}");
         }
         Message::Request{ index, begin, length } => {
             payload.push(6);
             send_index_begin(&mut payload, index, begin);
             payload.extend((length as u32).to_be_bytes());
             log = format!(
-                "{}: Sent request {{index: {}, begin: {}, length: {}}}",
-                name, index, begin, length
+                "Sent request {{index: {}, begin: {}, length: {}}}",
+                index, begin, length
             );
         }
         Message::Cancel{ index, begin, length } => {
@@ -158,8 +177,8 @@ async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Resu
             send_index_begin(&mut payload, index, begin);
             payload.extend((length as u32).to_be_bytes());
             log = format!(
-                "{}: Sent cancel {{index: {}, begin: {}, length: {}}}",
-                name, index, begin, length
+                "Sent cancel {{index: {}, begin: {}, length: {}}}",
+                index, begin, length
             );
         }
         Message::Piece{ index, begin, piece } => {
@@ -168,26 +187,38 @@ async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Resu
             let piece_length = piece.len();
             payload.extend(piece);
             log = format!(
-                "{}: Sent piece {{index: {}, begin: {}, length: {}}}",
-                name, index, begin, piece_length
+                "Sent piece {{index: {}, begin: {}, length: {}}}",
+                index, begin, piece_length
             );
         }
         Message::Choked(choked) => {
             payload.push(if choked {0} else {1});
-            log = format!("{name}: Sent choke of {choked}");
+            log = format!("Sent choke of {choked}");
         }
         Message::Interested(interested) => {
             payload.push(if interested {2} else {3});
-            log = format!("{name}: Sent interest of {interested}");
+            log = format!("Sent interest of {interested}");
+        }
+
+        // extensions
+        Message::Reject{ index, begin, length } => {
+            payload.push(8);
+            send_index_begin(&mut payload, index, begin);
+            payload.extend((length as u32).to_be_bytes());
+            log = format!(
+                "Sent reject {{index: {}, begin: {}, length: {}}}",
+                index, begin, length
+            );
         }
 
         Message::KeepAlive => {}
+        Message::Unsupported => {}
     }
 
     let length = u32::try_from(payload.len())?;
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&payload).await?;
-    eprintln!("{log}");
+    info!(peer = %name, "{log}");
     Ok(())
 }
 
@@ -219,7 +250,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             );
             let mut bitfield = vec![0u8; message_length - 1];
             reader.read_exact(&mut bitfield).await?;
-            println!("{name}: Received bitfield {:?}", bitfield);
+            info!(peer = %name, "Received bitfield {:?}", bitfield);
             Ok(Message::Bitfield(PieceBitfield::from_vec(bitfield)))
         }
         4 => { // have
@@ -229,7 +260,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             );
             reader.read_exact(&mut int_buf).await?;
             let index = u32::from_be_bytes(int_buf) as usize;
-            println!("{name}: Received have {:?}", index);
+            info!(peer = %name, "Received have {:?}", index);
             Ok(Message::Have(index))
         }
         6 => { // request
@@ -240,8 +271,8 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             reader.read_exact(&mut int_buf).await?;
             let length = u32::from_be_bytes(int_buf) as usize;
-            eprintln!(
-                "{name}: Received request {{index: {}, begin: {}, length: {}}}",
+            info!(peer = %name,
+                "Received request {{index: {}, begin: {}, length: {}}}",
                 index, begin, length
             );
             Ok(Message::Request { index, begin, length })
@@ -254,8 +285,8 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             let mut piece = vec![0u8; message_length - 1 - 4 - 4];
             reader.read_exact(&mut piece).await?;
-            eprintln!(
-                "{name}: Received piece {{index: {}, begin: {}, length: {}}}",
+            info!(peer = %name,
+                "Received piece {{index: {}, begin: {}, length: {}}}",
                 index, begin, piece.len()
             );
             Ok(Message::Piece { index, begin, piece })
@@ -268,8 +299,8 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             reader.read_exact(&mut int_buf).await?;
             let length = u32::from_be_bytes(int_buf) as usize;
-            eprintln!(
-                "{name}: Received cancel {{index: {}, begin: {}, length: {}}}",
+            info!(peer = %name,
+                "Received cancel {{index: {}, begin: {}, length: {}}}",
                 index, begin, length
             );
             Ok(Message::Cancel { index, begin, length })
@@ -279,7 +310,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of a choke payload should be 1, got {message_length}"
             );
-            println!("{name}: Received choke");
+            info!(peer = %name, "Received choke");
             Ok(Message::Choked(true))
         }
         1 => {
@@ -287,7 +318,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an unchoke payload should be 1, got {message_length}"
             );
-            println!("{name}: Received unchoke");
+            info!(peer = %name, "Received unchoke");
             Ok(Message::Choked(false))
         }
         2 => {
@@ -295,7 +326,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an intereseted payload should be 1, got {message_length}"
             );
-            println!("{name}: Received interested");
+            info!(peer = %name, "Received interested");
             Ok(Message::Interested(true))
         }
         3 => {
@@ -303,9 +334,31 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an uninterested payload should be 1, got {message_length}"
             );
-            println!("{name}: Received uninterested");
+            info!(peer = %name, "Received uninterested");
             Ok(Message::Interested(false))
         }
-        _ => panic!("Unsupported peer message"),
+
+        // extensions
+        16 => { // reject
+            anyhow::ensure!(
+                message_length == 1 + 4 + 4 + 4,
+                "The length of a reject payloud should be 13, got {message_length}"
+            );
+            let (index, begin) = receive_index_begin(reader).await?;
+            reader.read_exact(&mut int_buf).await?;
+            let length = u32::from_be_bytes(int_buf) as usize;
+            info!(peer = %name,
+                "Received reject {{index: {}, begin: {}, length: {}}}",
+                index, begin, length
+            );
+            Ok(Message::Reject { index, begin, length })
+        }
+
+        _ => {
+            let mut payload = vec![0u8; message_length - 1];
+            reader.read_exact(&mut payload).await?;
+            info!(peer = %name, "Unsopported message {}", id_buf[0]);
+            Ok(Message::Unsupported)
+        }
     }
 }

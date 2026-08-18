@@ -2,7 +2,10 @@ use reqwest::Url;
 use anyhow::Result;
 use std::fmt;
 
-use crate::bencode::BencodeValue;
+use crate::{
+    bencode::BencodeValue,
+    peer::PeerId,
+};
 
 pub enum Event {
     Started,
@@ -20,6 +23,7 @@ impl Event {
     }
 }
 
+#[derive(Clone)]
 pub struct PeerInfo {
     pub id: Option<[u8; 20]>,
     pub host: String,
@@ -81,6 +85,7 @@ impl Response {
 }
 
 pub async fn tracker_request(
+    client_id: &PeerId,
     url: &str,
     info_hash: &[u8; 20],
     uploaded: usize,
@@ -91,7 +96,6 @@ pub async fn tracker_request(
     let mut url = Url::parse(url)?;
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("peer_id", "aaaaaaaaaaaaaaaaaaaa");
         query.append_pair("port", "6881");
         query.append_pair("uploaded", &uploaded.to_string());
         query.append_pair("downloaded", &downloaded.to_string());
@@ -103,7 +107,11 @@ pub async fn tracker_request(
         .iter() .map(|b| format!("%{b:02X}"))
         .collect::<String>();
 
-    let url = format!("{url}&info_hash={info_hash}");
+    let client_id = client_id
+        .iter() .map(|b| format!("%{b:02X}"))
+        .collect::<String>();
+
+    let url = format!("{url}&info_hash={info_hash}&peer_id={client_id}");
 
     let res = reqwest::get(url).await?;
     let body = res.bytes().await?;

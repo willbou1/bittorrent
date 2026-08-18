@@ -11,19 +11,28 @@ use std::{
 };
 
 use torrent::Torrent;
+use peer::PeerId;
 use bencode::BencodeValue;
+use tracing_subscriber;
+use rand::Rng;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .without_time()
+        .init();
+
     let args: Vec<String> = env::args().collect();
     let command = &args[1];
     let second = &args[2];
 
     match command.as_str() {
         "info" | "download" => {
+            let mut client_id = [0; 20];
+            rand::rng().fill_bytes(&mut client_id);
             let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second)).await.unwrap();
             if command == "download" {
-                torrent.download().await.unwrap();
+                torrent.download(&client_id).await.unwrap();
             }
         }
         "decode" => {
