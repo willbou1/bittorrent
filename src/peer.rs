@@ -119,7 +119,7 @@ impl Peer {
                     match message {
                         Some(message) => {
                             if let Err(e) = send(&mut writer, &name, message).await {
-                                let _ = tx.send(Event::PeerDisconnection(id)).await;
+                                let _ = tx.send(Event::Disconnection(id)).await;
                                 return Err(e.into());
                             }
                         }
@@ -130,10 +130,10 @@ impl Peer {
                 result = receive(&mut reader, &name) => {
                     match result {
                         Ok(message) => {
-                            tx.send(Event::PeerMessage(id, message)).await?;
+                            tx.send(Event::Message(id, message)).await?;
                         }
                         Err(e) => {
-                            let _ = tx.send(Event::PeerDisconnection(id)).await;
+                            let _ = tx.send(Event::Disconnection(id)).await;
                             return Err(e.into());
                         }
                     }

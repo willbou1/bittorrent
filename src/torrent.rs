@@ -1,4 +1,3 @@
-use std::{collections::HashMap, path::PathBuf};
 use sha1::{Sha1, Digest};
 use anyhow::Result;
 use tokio::{
@@ -8,9 +7,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 use std::{
-    path::Path,
+    collections::HashMap,
+    path::{Path, PathBuf},
     io::SeekFrom,
-    time::{Duration},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -23,12 +23,13 @@ use crate::{
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
-const MAX_REQUESTS: usize = 1;
+const MAX_REQUESTS: usize = 3;
 
 pub enum Event {
-    PeerMessage(PeerId, Message),
-    PeerConnection(Peer, PeerInfo),
-    PeerDisconnection(PeerId),
+    Message(PeerId, Message),
+    Connection(Peer, PeerInfo),
+    ConnectionFailure(PeerInfo, anyhow::Error),
+    Disconnection(PeerId),
 }
 
 pub struct Connection {
@@ -84,10 +85,11 @@ impl Piece {
 
 pub struct Torrent {
     pub metainfo: Metainfo,
-    pub connections: HashMap<PeerId, Connection>,
-    pub pieces: Vec<Piece>,
-    pub rx: mpsc::Receiver<Event>,
-    pub peer_tx: mpsc::Sender<Event>,
+    connections: HashMap<PeerId, Connection>,
+    pieces: Vec<Piece>,
+    last_announce: Instant,
+    rx: mpsc::Receiver<Event>,
+    peer_tx: mpsc::Sender<Event>,
 }
 
 impl Torrent {
@@ -107,6 +109,7 @@ impl Torrent {
 
         Ok(Self {
             connections: HashMap::new(),
+            last_announce: Instant::now(),
             pieces,
             metainfo,
             peer_tx: tx,
@@ -134,23 +137,28 @@ impl Torrent {
                     &info_hash,
                     &client_id,
                 ).await {
-                    Ok(peer) => {
-                        let _ = tx.send(Event::PeerConnection(peer, peer_info)).await;
-                    }
-                    Err(e) => {
-                        info!(peer = %peer_info, "Couldn't connect ({e})");
-                    }
+                    Ok(peer) => tx.send(Event::Connection(peer, peer_info)).await,
+                    Err(e) => tx.send(Event::ConnectionFailure(peer_info, e)).await,
                 }
             });
         }
 
+        self.announce().await?;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 event = self.rx.recv() => {
+                    if self.last_announce.elapsed() > Duration::from_secs(tracker_response.interval) { 
+                        self.last_announce = Instant::now();
+                        self.announce().await?;
+                    }
                     self.handle_event(event.unwrap()).await?
                 }
                 _ = interval.tick() => {
+                    if self.last_announce.elapsed() > Duration::from_secs(tracker_response.interval) {
+                        self.last_announce = Instant::now();
+                        self.announce().await?;
+                    }
                     self.tick().await?
                 }
             }
@@ -235,6 +243,11 @@ impl Torrent {
         }).await?;
         info!(peer = %connection.info,"Requested block {piece_index}:{block_index}");
 
+        Ok(())
+    }
+
+    async fn announce(&mut self) -> Result<()> {
+        info!("Announcing");
         Ok(())
     }
 
@@ -352,7 +365,7 @@ impl Torrent {
 
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::PeerMessage(peer_id, message) => {
+            Event::Message(peer_id, message) => {
                 if let Some(connection) = self.connections.get_mut(&peer_id) {
                     match message {
                         Message::Bitfield(bitfield) => {
@@ -437,7 +450,7 @@ impl Torrent {
                 }
             }
 
-            Event::PeerConnection(peer, info) => {
+            Event::Connection(peer, info) => {
                 let (tx, rx) = mpsc::channel(100);
                 tx.send(Message::Interested(true)).await?;
                 self.connections.insert(
@@ -448,7 +461,11 @@ impl Torrent {
                 info!(peer = %info,"Connected with interest");
             }
 
-            Event::PeerDisconnection(peer_id) => {
+            Event::ConnectionFailure(peer_info, e) => {
+                info!(peer = %peer_info, "Couldn't connect ({e})");
+            }
+
+            Event::Disconnection(peer_id) => {
                 let connection = self.connections.remove(&peer_id).unwrap();
                 info!(peer = %connection.info,"Handled disconnect");
                 // TODO put all downloading blocks to unobtained
