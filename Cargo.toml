@@ -15,6 +15,6 @@ sha1 = "0.10.1"                                                    # hashing
 tempfile = "3"                                                     # creating temporary directories
 tokio = { version = "1.23.0", features = ["full"] }                # async http requests
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.10.2"
 

@@ -4,6 +4,7 @@ mod tracker;
 mod peer;
 mod bitfield;
 mod torrent;
+mod timer;
 
 use std::{
     path::PathBuf,
@@ -13,12 +14,16 @@ use std::{
 use torrent::Torrent;
 use peer::PeerId;
 use bencode::BencodeValue;
-use tracing_subscriber;
+use tracing_subscriber::{EnvFilter, fmt};
 use rand::Rng;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info"))
+        )
         .without_time()
         .init();
 
@@ -30,6 +35,7 @@ async fn main() {
         "info" | "download" => {
             let mut client_id = [0; 20];
             rand::rng().fill_bytes(&mut client_id);
+            println!("Client id: {}", client_id.map(|b| format!("{b:02x}")).join(""));
             let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second)).await.unwrap();
             if command == "download" {
                 torrent.download(&client_id).await.unwrap();

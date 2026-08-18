@@ -3,7 +3,7 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::trace;
 
 use crate::{
     tracker::PeerInfo,
@@ -38,7 +38,7 @@ pub enum Message {
         begin: usize,
         piece: Vec<u8>,
     },
-    Unsupported,
+    Unsupported(u8),
 }
 
 pub type PeerId = [u8; 20];
@@ -61,7 +61,7 @@ impl Peer {
         let mut stream = TcpStream::connect(
             format!("{}:{}", peer_info.host, peer_info.port)
         ).await?;
-        info!(peer = %name, "Connected");
+        trace!(peer = %name, "Connected");
 
         // Send the handshake
         handshake[0] = 19;
@@ -70,7 +70,7 @@ impl Peer {
         handshake[28..48].copy_from_slice(info_hash);
         handshake[48..68].copy_from_slice(local_id);
         stream.write_all(&handshake).await?;
-        info!(peer = %name, "Sent handshake");
+        trace!(peer = %name, "Sent handshake");
 
         // Receive the handshake response and verify it is right
         stream.read_exact(&mut handshake).await?;
@@ -92,7 +92,7 @@ impl Peer {
                 "expected handshake response to have right peer id"
             );
         }
-        info!(peer = %name, "Received handshake");
+        trace!(peer = %name, "Received handshake");
 
         Ok(Self {
             stream,
@@ -212,13 +212,13 @@ async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Resu
         }
 
         Message::KeepAlive => {}
-        Message::Unsupported => {}
+        Message::Unsupported(_) => {}
     }
 
     let length = u32::try_from(payload.len())?;
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&payload).await?;
-    info!(peer = %name, "{log}");
+    trace!(peer = %name, "{log}");
     Ok(())
 }
 
@@ -250,7 +250,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             );
             let mut bitfield = vec![0u8; message_length - 1];
             reader.read_exact(&mut bitfield).await?;
-            info!(peer = %name, "Received bitfield {:?}", bitfield);
+            trace!(peer = %name, "Received bitfield {:?}", bitfield);
             Ok(Message::Bitfield(PieceBitfield::from_vec(bitfield)))
         }
         4 => { // have
@@ -260,7 +260,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             );
             reader.read_exact(&mut int_buf).await?;
             let index = u32::from_be_bytes(int_buf) as usize;
-            info!(peer = %name, "Received have {:?}", index);
+            trace!(peer = %name, "Received have {:?}", index);
             Ok(Message::Have(index))
         }
         6 => { // request
@@ -271,7 +271,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             reader.read_exact(&mut int_buf).await?;
             let length = u32::from_be_bytes(int_buf) as usize;
-            info!(peer = %name,
+            trace!(peer = %name,
                 "Received request {{index: {}, begin: {}, length: {}}}",
                 index, begin, length
             );
@@ -285,7 +285,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             let mut piece = vec![0u8; message_length - 1 - 4 - 4];
             reader.read_exact(&mut piece).await?;
-            info!(peer = %name,
+            trace!(peer = %name,
                 "Received piece {{index: {}, begin: {}, length: {}}}",
                 index, begin, piece.len()
             );
@@ -299,7 +299,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             reader.read_exact(&mut int_buf).await?;
             let length = u32::from_be_bytes(int_buf) as usize;
-            info!(peer = %name,
+            trace!(peer = %name,
                 "Received cancel {{index: {}, begin: {}, length: {}}}",
                 index, begin, length
             );
@@ -310,7 +310,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of a choke payload should be 1, got {message_length}"
             );
-            info!(peer = %name, "Received choke");
+            trace!(peer = %name, "Received choke");
             Ok(Message::Choked(true))
         }
         1 => {
@@ -318,7 +318,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an unchoke payload should be 1, got {message_length}"
             );
-            info!(peer = %name, "Received unchoke");
+            trace!(peer = %name, "Received unchoke");
             Ok(Message::Choked(false))
         }
         2 => {
@@ -326,7 +326,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an intereseted payload should be 1, got {message_length}"
             );
-            info!(peer = %name, "Received interested");
+            trace!(peer = %name, "Received interested");
             Ok(Message::Interested(true))
         }
         3 => {
@@ -334,7 +334,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
                 message_length == 1,
                 "The length of an uninterested payload should be 1, got {message_length}"
             );
-            info!(peer = %name, "Received uninterested");
+            trace!(peer = %name, "Received uninterested");
             Ok(Message::Interested(false))
         }
 
@@ -347,7 +347,7 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
             let (index, begin) = receive_index_begin(reader).await?;
             reader.read_exact(&mut int_buf).await?;
             let length = u32::from_be_bytes(int_buf) as usize;
-            info!(peer = %name,
+            trace!(peer = %name,
                 "Received reject {{index: {}, begin: {}, length: {}}}",
                 index, begin, length
             );
@@ -357,8 +357,8 @@ async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
         _ => {
             let mut payload = vec![0u8; message_length - 1];
             reader.read_exact(&mut payload).await?;
-            info!(peer = %name, "Unsopported message {}", id_buf[0]);
-            Ok(Message::Unsupported)
+            trace!(peer = %name, "Unsopported message {}", id_buf[0]);
+            Ok(Message::Unsupported(id_buf[0]))
         }
     }
 }

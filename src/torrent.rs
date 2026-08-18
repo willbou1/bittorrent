@@ -6,24 +6,24 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc,
 };
-use tracing::{Instrument, info};
+use tracing::{info, warn};
 use std::{
     path::Path,
     io::SeekFrom,
-    time::{Instant, Duration},
+    time::{Duration},
 };
-use rand;
 
 use crate::{
     bitfield::PieceBitfield,
     metainfo::Metainfo,
     peer::{Peer,Message,PeerId},
     tracker::{PeerInfo},
-    tracker
+    tracker,
+    timer::Timer,
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
-const MAX_REQUESTS: usize = 2;
+const MAX_REQUESTS: usize = 1;
 
 pub enum Event {
     PeerMessage(PeerId, Message),
@@ -62,7 +62,7 @@ enum Block {
     Unobtained,
     Downloading {
         peer_id: PeerId,
-        requested_at: Instant,
+        timer: Timer,
     },
     Downloaded(Vec<u8>),
     Written,
@@ -233,6 +233,7 @@ impl Torrent {
             begin: begin,
             length: length,
         }).await?;
+        info!(peer = %connection.info,"Requested block {piece_index}:{block_index}");
 
         Ok(())
     }
@@ -278,9 +279,11 @@ impl Torrent {
                         if matches!(block, Block::Unobtained) {
                             self.request_block(&peer_id, p, b).await?;
                             let connection = self.connections.get_mut(peer_id).unwrap();
+                            let mut timer = Timer::new();
+                            timer.start();
                             self.pieces[p].blocks[b] = Block::Downloading {
                                 peer_id: peer_id.clone(),
-                                requested_at: Instant::now(),
+                                timer,
                             };
                             connection.sent_requests += 1;
                             break 'outer;
@@ -307,8 +310,8 @@ impl Torrent {
 
             for (b, block) in piece.blocks.iter_mut().enumerate() {
                 match block {
-                    Block::Downloading { requested_at, peer_id } => {
-                        if requested_at.elapsed() > Duration::from_secs(3) {
+                    Block::Downloading { timer, peer_id } => {
+                        if timer.elapsed() > Duration::from_secs(10) {
                             match self.connections.get_mut(peer_id) {
                                 Some(connection) => connection.sent_requests -= 1,
                                 None => (),
@@ -324,74 +327,114 @@ impl Torrent {
         self.schedule().await
     }
 
+    fn choke_blocks(&mut self, block_peer_id: &PeerId, choked: bool) {
+        for (p, piece) in self.pieces.iter_mut().enumerate() {
+            if piece.is_downloaded() || piece.is_written() {
+                continue;
+            }
+
+            for (b, block) in piece.blocks.iter_mut().enumerate() {
+                match block {
+                    Block::Downloading { timer, peer_id } => {
+                        if block_peer_id == peer_id {
+                            if choked {
+                                timer.stop();
+                            } else {
+                                timer.start();
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::PeerMessage(peer_id, message) => {
-                let connection = self.connections.get_mut(&peer_id).unwrap();
-                match message {
-                    Message::Bitfield(bitfield) => {
-                        anyhow::ensure!(
-                            bitfield.num_bytes() == connection.piece_bitfield.num_bytes(),
-                            "The received bitfield should be {} bytes long, got {}",
-                            connection.piece_bitfield.num_bytes(), bitfield.num_bytes()
-                        );
-                        connection.piece_bitfield.set_bytes(bitfield.as_bytes());
-                        info!(peer = %connection.info,"Handled bitfield");
-                    }
-                    Message::Have(index) => {
-                        anyhow::ensure!(
-                            index < self.metainfo.num_pieces,
-                            "The index of have leads outside the number of pieces, got {}",
-                            index
-                        );
-                        connection.piece_bitfield.set_piece(index);
-                        info!(peer = %connection.info,"Handled have");
-                    }
-                    Message::Request { index, begin, length } => {
-                        anyhow::ensure!(
-                            index < self.metainfo.num_pieces,
-                            "The index of request leads outside the number of pieces, got {}",
-                            index
-                        );
-                        // TODO let's queue that later
-                        info!(peer = %connection.info,"Handled request");
-                    }
-                    Message::Cancel { index, begin, length } => {
-                        anyhow::ensure!(
-                            index < self.metainfo.num_pieces,
-                            "The index of piece leads outside the number of pieces, got {}",
-                            index
-                        );
-                        anyhow::ensure!(
-                            begin % BLOCK_SIZE == 0,
-                            "Begin is not at block boundary, got {}",
-                            begin
-                        );
-                        info!(peer = %connection.info,"Handled cancel");
-                    }
-                    Message::Piece { index, begin, piece } => {
-                        anyhow::ensure!(
-                            index < self.metainfo.num_pieces,
-                            "The index of piece leads outside the number of pieces, got {}",
-                            index
-                        );
-                        anyhow::ensure!(
-                            begin % BLOCK_SIZE == 0,
-                            "Begin is not at block boundary, got {}",
-                            begin
-                        );
-                        info!(peer = %connection.info,"Handled piece");
-                        let block_index = begin / BLOCK_SIZE;
-                        self.pieces[index].blocks[block_index] = Block::Downloaded(piece);
-                        self.connections.get_mut(&peer_id).unwrap().sent_requests -= 1;
-                    }
+                if let Some(connection) = self.connections.get_mut(&peer_id) {
+                    match message {
+                        Message::Bitfield(bitfield) => {
+                            anyhow::ensure!(
+                                bitfield.num_bytes() == connection.piece_bitfield.num_bytes(),
+                                "The received bitfield should be {} bytes long, got {}",
+                                connection.piece_bitfield.num_bytes(), bitfield.num_bytes()
+                            );
+                            connection.piece_bitfield.set_bytes(bitfield.as_bytes());
+                            info!(peer = %connection.info,"Set bitfield {:?}", bitfield.as_bytes());
+                        }
+                        Message::Have(index) => {
+                            anyhow::ensure!(
+                                index < self.metainfo.num_pieces,
+                                "The index of have leads outside the number of pieces, got {}",
+                                index
+                            );
+                            connection.piece_bitfield.set_piece(index);
+                            info!(peer = %connection.info,"Handled have");
+                        }
+                        Message::Request { index, begin, length } => {
+                            anyhow::ensure!(
+                                index < self.metainfo.num_pieces,
+                                "The index of request leads outside the number of pieces, got {}",
+                                index
+                            );
+                            // TODO let's queue that later
+                            info!(peer = %connection.info,"Handled request");
+                        }
+                        Message::Cancel { index, begin, length } => {
+                            anyhow::ensure!(
+                                index < self.metainfo.num_pieces,
+                                "The index of piece leads outside the number of pieces, got {}",
+                                index
+                            );
+                            anyhow::ensure!(
+                                begin % BLOCK_SIZE == 0,
+                                "Begin is not at block boundary, got {}",
+                                begin
+                            );
+                            info!(peer = %connection.info,"Handled cancel");
+                        }
+                        Message::Piece { index, begin, piece } => {
+                            anyhow::ensure!(
+                                index < self.metainfo.num_pieces,
+                                "The index of piece leads outside the number of pieces, got {}",
+                                index
+                            );
+                            anyhow::ensure!(
+                                begin % BLOCK_SIZE == 0,
+                                "Begin is not at block boundary, got {}",
+                                begin
+                            );
+                            let block_index = begin / BLOCK_SIZE;
+                            info!(peer = %connection.info,"Got block {index}:{block_index}");
+                            self.pieces[index].blocks[block_index] = Block::Downloaded(piece);
+                            self.connections.get_mut(&peer_id).unwrap().sent_requests -= 1;
+                        }
 
-                    Message::Choked(choked) => connection.choked = choked,
-                    Message::Interested(interested) => connection.interested = interested,
-                    Message::KeepAlive => {}
-                    _ => info!(peer = %connection.info, "Handle unsupported message {:?}", message),
+                        Message::Choked(choked) => {
+                            connection.choked = choked;
+                            warn!(peer = %connection.info,"Set choke {choked}");
+                            self.choke_blocks(&peer_id, choked);
+                        }
+
+                        // extensions
+                        Message::Reject { index, begin, length } => {
+                            anyhow::ensure!(
+                                index < self.metainfo.num_pieces,
+                                "The index of request leads outside the number of pieces, got {}",
+                                index
+                            );
+                            let block_index = begin / BLOCK_SIZE;
+                            info!(peer = %connection.info,"Got rejection for block {index}:{block_index}");
+                        }
+
+                        Message::Interested(interested) => connection.interested = interested,
+                        Message::KeepAlive => {}
+                        Message::Unsupported(no) => warn!(peer = %connection.info, "Handle unsupported message {no}"),
+                    }
+                    self.schedule().await?
                 }
-                self.schedule().await?
             }
 
             Event::PeerConnection(peer, info) => {
@@ -402,12 +445,13 @@ impl Torrent {
                     Connection::new(tx, self.metainfo.num_pieces, &info),
                 );
                 tokio::spawn(peer.run(self.peer_tx.clone(), rx));
-                info!(peer = %info,"Handled connection");
+                info!(peer = %info,"Connected with interest");
             }
 
             Event::PeerDisconnection(peer_id) => {
                 let connection = self.connections.remove(&peer_id).unwrap();
                 info!(peer = %connection.info,"Handled disconnect");
+                // TODO put all downloading blocks to unobtained
             }
         }
         Ok(())
