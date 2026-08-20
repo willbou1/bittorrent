@@ -1,6 +1,10 @@
 use reqwest::Url;
 use anyhow::Result;
-use std::fmt;
+use tracing::{info};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 use crate::{
     bencode::BencodeValue,
@@ -28,14 +32,6 @@ pub struct PeerInfo {
     pub id: Option<[u8; 20]>,
     pub host: String,
     pub port: u16,
-}
-
-pub struct Response {
-    pub interval: u64,
-    pub min_interval: Option<u64>,
-    pub complete: Option<u64>,
-    pub incomplete: Option<u64>,
-    pub peers: Vec<PeerInfo>,
 }
 
 impl PeerInfo {
@@ -68,57 +64,120 @@ impl PeerInfo {
     }
 }
 
-impl Response {
-    fn from_bytes(encoded: &[u8]) -> Result<Self, String> {
+pub struct Tracker {
+    url: String,
+    info_hash: String,
+    client_id: String,
+    last_announce_time: Instant,
+
+    pub interval: Option<u64>,
+    pub min_interval: Option<u64>,
+    pub complete: Option<u64>,
+    pub incomplete: Option<u64>,
+    pub peers: Vec<PeerInfo>,
+}
+
+impl Tracker {
+    pub fn from_url(url: &str, client_id: &PeerId, info_hash: &[u8; 20]) -> Self {
+        let info_hash = info_hash
+            .iter() .map(|b| format!("%{b:02X}"))
+            .collect::<String>();
+
+        let client_id = client_id
+            .iter() .map(|b| format!("%{b:02X}"))
+            .collect::<String>();
+
+        Self {
+            last_announce_time: Instant::now(),
+            url: url.to_string(),
+            info_hash,
+            client_id,
+
+            interval: None,
+            min_interval: None,
+            complete: None,
+            incomplete: None,
+            peers: Vec::new(),
+        }
+    }
+
+    pub async fn tick(
+        &mut self,
+        uploaded: usize,
+        downloaded: usize,
+        left: usize,
+        event: Event,
+    ) -> bool {
+        if let Some(interval) = self.interval {
+            // TODO remove fake interval
+            if self.last_announce_time.elapsed() > Duration::from_secs(30) {
+                self.announce(uploaded, downloaded, left, event).await;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn announce(
+        &mut self,
+        uploaded: usize,
+        downloaded: usize,
+        left: usize,
+        event: Event,
+    ) -> bool {
+        self.last_announce_time = Instant::now();
+        match self.request(uploaded, downloaded, left, event).await {
+            Ok(()) => {
+                info!(tracker = %self.url, "Successfully announced");
+                true
+            }
+            Err(e) => {
+                info!(tracker = %self.url, "Failed to announce {e}");
+                false
+            }
+        }
+    }
+
+    async fn request(
+        &mut self,
+        uploaded: usize,
+        downloaded: usize,
+        left: usize,
+        event: Event,
+    ) -> Result<()> {
+        let mut url = Url::parse(&self.url)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("port", "6881");
+            query.append_pair("uploaded", &uploaded.to_string());
+            query.append_pair("downloaded", &downloaded.to_string());
+            query.append_pair("left", &left.to_string());
+            query.append_pair("event", &event.to_string());
+        }
+
+        let res = reqwest::get(
+            format!("{url}&info_hash={}&peer_id={}", self.info_hash, self.client_id)
+        ).await?;
+        let body = res.bytes().await?;
+        self.decode_request(&body)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        Ok(())
+    }
+
+    fn decode_request(&mut self, encoded: &[u8]) -> Result<(), String> {
         let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
             || "Unable to find root dictionary"
         )?;
 
-        Ok(Self {
-            interval: root.required_unsigned("interval")?,
-            min_interval: root.optional_unsigned("interval")?,
-            complete: root.optional_unsigned("complete")?,
-            incomplete: root.optional_unsigned("incomplete")?,
-            peers: PeerInfo::from_bencode(root.required("peers")?)?,
-        })
+        self.interval = Some(root.required_unsigned("interval")?);
+        self.min_interval = root.optional_unsigned("min interval")?;
+        self.complete = root.optional_unsigned("complete")?;
+        self.incomplete = root.optional_unsigned("incomplete")?;
+        self.peers = PeerInfo::from_bencode(root.required("peers")?)?;
+
+        Ok(())
     }
-}
-
-pub async fn tracker_request(
-    client_id: &PeerId,
-    url: &str,
-    info_hash: &[u8; 20],
-    uploaded: usize,
-    downloaded: usize,
-    left: usize,
-    event: Event,
-) -> Result<Response> {
-    let mut url = Url::parse(url)?;
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("port", "6881");
-        query.append_pair("uploaded", &uploaded.to_string());
-        query.append_pair("downloaded", &downloaded.to_string());
-        query.append_pair("left", &left.to_string());
-        query.append_pair("event", &event.to_string());
-    }
-
-    let info_hash = info_hash
-        .iter() .map(|b| format!("%{b:02X}"))
-        .collect::<String>();
-
-    let client_id = client_id
-        .iter() .map(|b| format!("%{b:02X}"))
-        .collect::<String>();
-
-    let url = format!("{url}&info_hash={info_hash}&peer_id={client_id}");
-
-    let res = reqwest::get(url).await?;
-    let body = res.bytes().await?;
-    let response = Response::from_bytes(&body)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
-    Ok(response)
 }
 
 impl fmt::Display for PeerInfo {
@@ -135,9 +194,11 @@ impl fmt::Display for PeerInfo {
     }
 }
 
-impl fmt::Display for Response {
+impl fmt::Display for Tracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Interval: {}", self.interval)?;
+        if let Some(interval) = self.interval {
+            writeln!(f, "Interval: {}", interval)?;
+        }
         if let Some(min_interval) = self.min_interval {
             writeln!(f, "Minimum interval: {}", min_interval)?;
         }

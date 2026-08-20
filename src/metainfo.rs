@@ -20,6 +20,7 @@ pub struct PieceFile {
 pub struct Metainfo {
     pub announces: Vec<Vec<String>>,
     pub created_by: Option<String>,
+    pub comment: Option<String>,
     pub name: String,
     pub piece_length: usize,
     pub pieces: Vec<[u8; 20]>,
@@ -64,7 +65,6 @@ impl Metainfo {
     }
     
     pub fn from_bytes(encoded: &[u8]) -> Result<Self, String> {
-
         let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
             || "Unable to find root dictionary"
         )?;
@@ -118,6 +118,7 @@ impl Metainfo {
                 None => vec![vec![root.required_string("announce")?]],
             },
             created_by: root.optional_string("created by")?,
+            comment: root.optional_string("comment")?,
             name,
             piece_length,
             pieces,
@@ -144,6 +145,9 @@ impl fmt::Display for Metainfo {
         writeln!(f, "Name: {}", self.name)?;
         if let Some(created_by) = &self.created_by {
             writeln!(f, "Created by: {}", created_by)?;
+        }
+        if let Some(comment) = &self.comment {
+            writeln!(f, "Comment: {}", comment)?;
         }
         writeln!(f, "{} pieces of {} kB", self.pieces.len(), self.piece_length / 1024)?;
         writeln!(f, "Info hash: {}", self.info_hash.map(|b| format!("{b:02x}")).join(""))?;

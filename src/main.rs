@@ -33,12 +33,12 @@ async fn main() {
 
     match command.as_str() {
         "info" | "download" => {
-            let mut client_id = [0; 20];
+            let mut client_id: PeerId = [0; 20];
             rand::rng().fill_bytes(&mut client_id);
             println!("Client id: {}", client_id.map(|b| format!("{b:02x}")).join(""));
-            let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second)).await.unwrap();
+            let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second), &client_id).await.unwrap();
             if command == "download" {
-                torrent.download(&client_id).await.unwrap();
+                torrent.download().await.unwrap();
             }
         }
         "decode" => {

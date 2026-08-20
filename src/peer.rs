@@ -102,41 +102,53 @@ impl Peer {
     }
 
     pub async fn run(
-        self,
-        tx: mpsc::Sender<Event>,
-        mut rx: mpsc::Receiver<Message>,
-    ) -> Result<()> {
+    self,
+    tx: mpsc::Sender<Event>,
+    mut rx: mpsc::Receiver<Message>,
+    ) {
         let Peer {
             stream,
             name,
             id,
         } = self;
+        
         let (mut reader, mut writer) = stream.into_split();
-
-        loop {
-            tokio::select! {
-                message = rx.recv() => {
-                    match message {
-                        Some(message) => {
-                            if let Err(e) = send(&mut writer, &name, message).await {
-                                let _ = tx.send(Event::Disconnection(id)).await;
-                                return Err(e.into());
-                            }
+        
+        let read_tx = tx.clone();
+        let read_name = name.clone();
+        
+        let reader_task = async move {
+            loop {
+                match receive(&mut reader, &read_name).await {
+                    Ok(message) => {
+                        if read_tx.send(Event::Message(id, message)).await.is_err() {
+                            return Ok(());
                         }
-                        None => return Ok(()),
+                    }
+                    Err(e) => {
+                        return Err(e);
                     }
                 }
-                
-                result = receive(&mut reader, &name) => {
-                    match result {
-                        Ok(message) => {
-                            tx.send(Event::Message(id, message)).await?;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Event::Disconnection(id)).await;
-                            return Err(e.into());
-                        }
-                    }
+            }
+        };
+        
+        let writer_task = async move {
+            while let Some(message) = rx.recv().await {
+                send(&mut writer, &name, message).await?;
+            }
+            
+            Ok::<_, anyhow::Error>(())
+        };
+        
+        tokio::select! {
+            result = reader_task => {
+                if let Err(e) = result {
+                    let _ = tx.send(Event::Disconnection(id, e)).await;
+                }
+            }
+            result = writer_task => {
+                if let Err(e) = result {
+                    let _ = tx.send(Event::Disconnection(id, e)).await;
                 }
             }
         }
@@ -202,7 +214,7 @@ async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Resu
 
         // extensions
         Message::Reject{ index, begin, length } => {
-            payload.push(8);
+            payload.push(16);
             send_index_begin(&mut payload, index, begin);
             payload.extend((length as u32).to_be_bytes());
             log = format!(
