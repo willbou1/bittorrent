@@ -1,16 +1,24 @@
+use rand::seq::SliceRandom;
 use reqwest::Url;
 use anyhow::Result;
-use tracing::{info};
+use tracing::{info, trace};
 use std::{
     fmt,
     time::{Duration, Instant},
+    collections::HashSet,
+};
+use tokio::{
+    sync::mpsc,
 };
 
 use crate::{
     bencode::BencodeValue,
     peer::PeerId,
+    torrent,
 };
+use rand;
 
+#[derive(Clone)]
 pub enum Event {
     Started,
     Completed,
@@ -27,7 +35,7 @@ impl Event {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Hash, Eq)]
 pub struct PeerInfo {
     pub id: Option<[u8; 20]>,
     pub host: String,
@@ -64,21 +72,32 @@ impl PeerInfo {
     }
 }
 
-pub struct Tracker {
-    url: String,
+pub struct TrackerTier {
+    urls: Vec<String>,
     info_hash: String,
     client_id: String,
     last_announce_time: Instant,
+    tier: usize,
+    tx: mpsc::Sender<torrent::Event>,
 
-    pub interval: Option<u64>,
+    pub interval: u64,
     pub min_interval: Option<u64>,
     pub complete: Option<u64>,
     pub incomplete: Option<u64>,
     pub peers: Vec<PeerInfo>,
 }
 
-impl Tracker {
-    pub fn from_url(url: &str, client_id: &PeerId, info_hash: &[u8; 20]) -> Self {
+impl TrackerTier {
+    pub fn from_urls(
+        tier: usize,
+        tx: mpsc::Sender<torrent::Event>,
+        urls: &[String],
+        client_id: &PeerId,
+        info_hash: &[u8; 20],
+    ) -> Self {
+        let mut urls = urls.to_vec();
+        urls.shuffle(&mut rand::rng());
+        
         let info_hash = info_hash
             .iter() .map(|b| format!("%{b:02X}"))
             .collect::<String>();
@@ -88,12 +107,14 @@ impl Tracker {
             .collect::<String>();
 
         Self {
-            last_announce_time: Instant::now(),
-            url: url.to_string(),
+            last_announce_time: Instant::now() - Duration::from_secs(60),
+            urls,
             info_hash,
             client_id,
+            tier,
+            tx,
 
-            interval: None,
+            interval: 60,
             min_interval: None,
             complete: None,
             incomplete: None,
@@ -108,44 +129,38 @@ impl Tracker {
         left: usize,
         event: Event,
     ) -> bool {
-        if let Some(interval) = self.interval {
-            // TODO remove fake interval
-            if self.last_announce_time.elapsed() > Duration::from_secs(30) {
-                self.announce(uploaded, downloaded, left, event).await;
-                return true;
+        if self.last_announce_time.elapsed() > Duration::from_secs(self.interval) {
+            self.last_announce_time = Instant::now();
+            let mut good_urls = Vec::new();
+            for u in 0..self.urls.len() {
+                let url = self.urls[u].clone();
+                match self.request(&url, uploaded, downloaded, left, &event).await {
+                    Ok(()) => {
+                        trace!(tracker = %url, "Successfully announced");
+                        good_urls.push(u);
+                    }
+                    Err(e) => trace!(tracker = %url, "Failed to announced {e}"),
+                }
             }
+            for u in good_urls {
+                let url = self.urls[u].clone();
+                self.urls.remove(u);
+                self.urls.insert(0, url);
+            }
+            let _ = self.tx.send(torrent::Event::Discovery(self.peers.clone())).await;
         }
         false
     }
 
-    pub async fn announce(
-        &mut self,
-        uploaded: usize,
-        downloaded: usize,
-        left: usize,
-        event: Event,
-    ) -> bool {
-        self.last_announce_time = Instant::now();
-        match self.request(uploaded, downloaded, left, event).await {
-            Ok(()) => {
-                info!(tracker = %self.url, "Successfully announced");
-                true
-            }
-            Err(e) => {
-                info!(tracker = %self.url, "Failed to announce {e}");
-                false
-            }
-        }
-    }
-
     async fn request(
         &mut self,
+        url: &str,
         uploaded: usize,
         downloaded: usize,
         left: usize,
-        event: Event,
+        event: &Event,
     ) -> Result<()> {
-        let mut url = Url::parse(&self.url)?;
+        let mut url = Url::parse(&url)?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("port", "6881");
@@ -170,11 +185,21 @@ impl Tracker {
             || "Unable to find root dictionary"
         )?;
 
-        self.interval = Some(root.required_unsigned("interval")?);
+        let interval = root.required_unsigned("interval")?;
+        if interval < self.interval {
+            self.interval = interval;
+        }
+
+        // TODO check min interval
         self.min_interval = root.optional_unsigned("min interval")?;
         self.complete = root.optional_unsigned("complete")?;
         self.incomplete = root.optional_unsigned("incomplete")?;
-        self.peers = PeerInfo::from_bencode(root.required("peers")?)?;
+
+        let new_peers = PeerInfo::from_bencode(root.required("peers")?)?;
+        let mut peers = HashSet::new();
+        peers.extend(self.peers);
+        peers.extend(new_peers);
+        self.peers = peers.into_iter().collect();
 
         Ok(())
     }
@@ -194,11 +219,9 @@ impl fmt::Display for PeerInfo {
     }
 }
 
-impl fmt::Display for Tracker {
+impl fmt::Display for TrackerTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(interval) = self.interval {
-            writeln!(f, "Interval: {}", interval)?;
-        }
+        writeln!(f, "Interval: {}", self.interval)?;
         if let Some(min_interval) = self.min_interval {
             writeln!(f, "Minimum interval: {}", min_interval)?;
         }

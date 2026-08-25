@@ -17,19 +17,20 @@ use crate::{
     bitfield::PieceBitfield,
     metainfo::Metainfo,
     peer::{Peer,Message,PeerId},
-    tracker::{PeerInfo, Tracker},
+    tracker::{PeerInfo, TrackerTier},
     tracker,
     timer::Timer,
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
-const MAX_REQUESTS: usize = 40;
+const MAX_REQUESTS: usize = 50;
 
 pub enum Event {
     Message(PeerId, Message),
     Connection(Peer, PeerInfo),
     ConnectionFailure(PeerInfo, anyhow::Error),
     Disconnection(PeerId, anyhow::Error),
+    Discovery(Vec<PeerInfo>),
 }
 
 pub struct Connection {
@@ -85,7 +86,6 @@ impl Piece {
 
 pub struct Torrent {
     metainfo: Metainfo,
-    tracker: Tracker,
     connections: HashMap<PeerId, Connection>,
     pieces: Vec<Piece>,
     last_announce: Instant,
@@ -109,8 +109,44 @@ impl Torrent {
             pieces.push(Piece::new(num_blocks));
         }
 
+        let all_urls = metainfo.announces.clone();
+        let tx_clone = tx.clone();
+        let client_id_clone = client_id.clone();
+        let info_hash_clone = metainfo.info_hash.clone();
+        tokio::spawn(async move {
+            let mut tracker_tiers = Vec::new();
+            for (t, urls) in all_urls.iter().enumerate() {
+                let tracker_tier = TrackerTier::from_urls(
+                    t,
+                    tx_clone.clone(),
+                    &urls,
+                    &client_id_clone,
+                    &info_hash_clone
+                );
+                tracker_tiers.push(tracker_tier);
+            }
+
+            let mut uploaded = 0;
+            let mut downloaded = 0;
+            let mut left = 0;
+            let mut event = tracker::Event::Started;
+
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                for tracker_tier in tracker_tiers.iter_mut() {
+                    info!("test");
+                    tracker_tier.tick(
+                        uploaded.clone(),
+                        downloaded.clone(),
+                        left.clone(),
+                        event.clone()
+                    ).await;
+                }
+            }
+        });
+
         Ok(Self {
-            tracker: Tracker::from_url(&metainfo.announces[0][0], &client_id, &metainfo.info_hash),
             connections: HashMap::new(),
             last_announce: Instant::now(),
             pieces,
@@ -122,35 +158,25 @@ impl Torrent {
     }
 
     pub async fn download(&mut self) -> Result<()> {
-        self.tracker.announce(0, 0, 0, tracker::Event::Started).await;
-        println!("{}", self.tracker);
 
-        for peer_info in self.tracker.peers.clone() {
-            let info_hash = self.metainfo.info_hash;
-            let tx = self.peer_tx.clone();
-            let client_id = self.client_id.clone();
-
-            tokio::spawn(async move {
-                match Peer::handshake(
-                    &peer_info,
-                    &info_hash,
-                    &client_id,
-                ).await {
-                    Ok(peer) => tx.send(Event::Connection(peer, peer_info)).await,
-                    Err(e) => tx.send(Event::ConnectionFailure(peer_info, e)).await,
-                }
-            });
-        }
+//            tokio::spawn(async move {
+//                match Peer::handshake(
+//                    &peer_info,
+//                    &info_hash,
+//                    &client_id,
+//                ).await {
+//                    Ok(peer) => tx.send(Event::Connection(peer, peer_info)).await,
+//                    Err(e) => tx.send(Event::ConnectionFailure(peer_info, e)).await,
+//                }
+//            });
 
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 event = self.rx.recv() => {
-                    self.tracker.tick(0, 0, 0, tracker::Event::Started).await;
                     self.handle_event(event.unwrap()).await?;
                 }
                 _ = interval.tick() => {
-                    self.tracker.tick(0, 0, 0, tracker::Event::Started).await;
                     self.tick().await?;
                 }
             }
@@ -456,6 +482,10 @@ impl Torrent {
                 let connection = self.connections.remove(&peer_id).unwrap();
                 info!(peer = %connection.info,"Handled disconnect {e}");
                 // TODO put all downloading blocks to unobtained
+            }
+
+            Event::Discovery(peers) => {
+                info!("Discovered peers");
             }
         }
         Ok(())
