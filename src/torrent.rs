@@ -17,8 +17,7 @@ use crate::{
     bitfield::PieceBitfield,
     metainfo::Metainfo,
     peer::{Peer,Message,PeerId},
-    tracker::{PeerInfo, TrackerTier},
-    tracker,
+    tracker::{PeerInfo, Trackers, Progress},
     timer::Timer,
 };
 
@@ -88,9 +87,9 @@ pub struct Torrent {
     metainfo: Metainfo,
     connections: HashMap<PeerId, Connection>,
     pieces: Vec<Piece>,
-    last_announce: Instant,
     rx: mpsc::Receiver<Event>,
     peer_tx: mpsc::Sender<Event>,
+    tracker_tx: mpsc::Sender<Progress>,
     client_id: PeerId,
 }
 
@@ -109,49 +108,23 @@ impl Torrent {
             pieces.push(Piece::new(num_blocks));
         }
 
-        let all_urls = metainfo.announces.clone();
-        let tx_clone = tx.clone();
-        let client_id_clone = client_id.clone();
-        let info_hash_clone = metainfo.info_hash.clone();
-        tokio::spawn(async move {
-            let mut tracker_tiers = Vec::new();
-            for (t, urls) in all_urls.iter().enumerate() {
-                let tracker_tier = TrackerTier::from_urls(
-                    t,
-                    tx_clone.clone(),
-                    &urls,
-                    &client_id_clone,
-                    &info_hash_clone
-                );
-                tracker_tiers.push(tracker_tier);
-            }
-
-            let mut uploaded = 0;
-            let mut downloaded = 0;
-            let mut left = 0;
-            let mut event = tracker::Event::Started;
-
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                for tracker_tier in tracker_tiers.iter_mut() {
-                    info!("test");
-                    tracker_tier.tick(
-                        uploaded.clone(),
-                        downloaded.clone(),
-                        left.clone(),
-                        event.clone()
-                    ).await;
-                }
-            }
-        });
+        let (tracker_tx, tracker_rx) = mpsc::channel(10);
+        let mut trackers = Trackers::from_metainfo(
+            tx.clone(),
+            tracker_rx,
+            client_id,
+            &metainfo,
+            0,
+            0,
+        );
+        tokio::spawn(trackers.run());
 
         Ok(Self {
             connections: HashMap::new(),
-            last_announce: Instant::now(),
             pieces,
             metainfo,
             peer_tx: tx,
+            tracker_tx,
             rx,
             client_id: client_id.clone(),
         })
@@ -291,7 +264,7 @@ impl Torrent {
                         if self.verify_piece(p, &assembled) {
                             self.write_piece(p, assembled).await?;
                             for (_, connection) in &self.connections {
-                                connection.tx.send(Message::Have(p)).await?;
+                                connection.tx.send(Message::Have { index: p} ).await?;
                             }
                         }
                         self.pieces[p].blocks.fill(Block::Written);
@@ -390,7 +363,7 @@ impl Torrent {
                             connection.piece_bitfield.set_bytes(bitfield.as_bytes());
                             info!(peer = %connection.info,"Set bitfield {:?}", bitfield.as_bytes());
                         }
-                        Message::Have(index) => {
+                        Message::Have { index } => {
                             anyhow::ensure!(
                                 index < self.metainfo.num_pieces,
                                 "The index of have leads outside the number of pieces, got {}",
@@ -457,7 +430,9 @@ impl Torrent {
 
                         Message::Interested(interested) => connection.interested = interested,
                         Message::KeepAlive => {}
-                        Message::Unsupported(no) => warn!(peer = %connection.info, "Handle unsupported message {no}"),
+                        Message::Unsupported { type_byte } => {
+                            warn!(peer = %connection.info, "Handle unsupported message {type_byte}");
+                        }
                     }
                     self.schedule().await?
                 }

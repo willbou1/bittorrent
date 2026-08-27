@@ -24,6 +24,7 @@ async fn main() {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info"))
                 .add_directive("hyper=warn".parse().unwrap())
+                .add_directive("reqwest=warn".parse().unwrap())
         )
         .without_time()
         .init();
