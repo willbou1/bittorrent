@@ -5,6 +5,8 @@ mod peer;
 mod bitfield;
 mod torrent;
 mod timer;
+mod piece;
+mod util;
 
 use std::{
     path::PathBuf,
@@ -26,6 +28,7 @@ async fn main() {
                 .add_directive("hyper=warn".parse().unwrap())
                 .add_directive("reqwest=warn".parse().unwrap())
         )
+        .with_target(false)
         .without_time()
         .init();
 
@@ -40,7 +43,7 @@ async fn main() {
             println!("Client id: {}", client_id.map(|b| format!("{b:02x}")).join(""));
             let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second), &client_id).await.unwrap();
             if command == "download" {
-                torrent.download().await.unwrap();
+                torrent.download().await;
             }
         }
         "decode" => {

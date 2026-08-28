@@ -2,14 +2,17 @@ use sha1::{Sha1, Digest};
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::bencode::BencodeValue;
+use crate::{
+    bencode::BencodeValue,
+    util::pretty_size,
+};
 
 pub struct MetainfoFile {
     pub path: PathBuf,
     pub length: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PieceFile {
     pub file_index: usize,
     pub piece_offset: usize,
@@ -142,23 +145,35 @@ impl Metainfo {
 
 impl fmt::Display for Metainfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Name: {}", self.name)?;
+        const LABEL_WIDTH: usize = 20;
+        const INDENT: &str = "    ";
+
+        writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Name", self.name)?;
         if let Some(created_by) = &self.created_by {
-            writeln!(f, "Created by: {}", created_by)?;
+            writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Created by", created_by)?;
+        }
+        writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{} ({})", "Pieces",
+            self.pieces.len(), pretty_size(self.piece_length))?;
+        writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Info hash",
+            self.info_hash.map(|b| format!("{b:02x}")).join(""))?;
+        writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Length",
+            pretty_size(self.length))?;
+        write!(f, "{INDENT}{:<LABEL_WIDTH$}", "Tracker tiers")?;
+        for (i, announce) in self.announces.iter().enumerate() {
+            if i != 0 {
+                write!(f, "{INDENT}{:<LABEL_WIDTH$}", "")?;
+            }
+            writeln!(f, "{}. {:?}", i + 1, announce)?;
+        }
+        write!(f, "{INDENT}{:<LABEL_WIDTH$}", "Files")?;
+        for (i, file) in self.files.iter().enumerate() {
+            if i != 0 {
+                write!(f, "{INDENT}{:<LABEL_WIDTH$}", "")?;
+            }
+            writeln!(f, "{} ({})", file.path.to_string_lossy(), pretty_size(file.length))?;
         }
         if let Some(comment) = &self.comment {
-            writeln!(f, "Comment: {}", comment)?;
-        }
-        writeln!(f, "{} pieces of {} kB", self.pieces.len(), self.piece_length / 1024)?;
-        writeln!(f, "Info hash: {}", self.info_hash.map(|b| format!("{b:02x}")).join(""))?;
-        writeln!(f, "Tracker tiers:")?;
-        for (i, announce) in self.announces.iter().enumerate() {
-            writeln!(f, "    {}. {:?}", i + 1, announce)?;
-        }
-        writeln!(f, "Length: {}", self.length)?;
-        writeln!(f, "Files:")?;
-        for file in &self.files {
-            writeln!(f, "    {} ({})", file.path.to_string_lossy(), file.length)?;
+            writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Comment", comment)?;
         }
         Ok(())
     }

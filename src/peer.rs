@@ -7,6 +7,11 @@ use tokio::{
     io::{AsyncWriteExt, AsyncReadExt},
     sync::mpsc,
 };
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Instant, Duration},
+};
 use tracing::trace;
 
 use crate::{
@@ -43,6 +48,7 @@ pub enum Message {
         index: usize,
         begin: usize,
         piece: Vec<u8>,
+        response_time: Option<Duration>,
     },
     Unsupported {
         type_byte: u8,
@@ -50,6 +56,8 @@ pub enum Message {
 }
 
 pub type PeerId = [u8; 20];
+type RequestKey = (usize, usize, usize);
+type RequestTimes = Arc<tokio::sync::Mutex<HashMap<RequestKey, Instant>>>;
 
 pub struct Peer {
     pub stream: TcpStream,
@@ -120,6 +128,10 @@ impl Peer {
             id,
         } = self;
         
+        let request_times = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let read_request_times = request_times.clone();
+        let write_request_times = request_times.clone();
+
         let (mut reader, mut writer) = stream.into_split();
         
         let read_tx = tx.clone();
@@ -127,7 +139,7 @@ impl Peer {
         
         let reader_task = async move {
             loop {
-                match Self::receive(&mut reader, &read_name).await {
+                match Self::receive(&mut reader, &read_name, read_request_times.clone()).await {
                     Ok(message) => {
                         if read_tx.send(Event::Message(id, message)).await.is_err() {
                             return Ok(());
@@ -142,7 +154,7 @@ impl Peer {
         
         let writer_task = async move {
             while let Some(message) = rx.recv().await {
-                Self::send(&mut writer, &name, message).await?;
+                Self::send(&mut writer, &name, message, write_request_times.clone()).await?;
             }
             
             Ok::<_, anyhow::Error>(())
@@ -162,7 +174,12 @@ impl Peer {
         }
     }
 
-    async fn send(writer: &mut OwnedWriteHalf, name: &str, message: Message) -> Result<()> {
+    async fn send(
+        writer: &mut OwnedWriteHalf,
+        name: &str,
+        message: Message,
+        request_times: RequestTimes,
+    ) -> Result<()> {
         let mut log = String::new();
         let mut payload = Vec::new();
 
@@ -190,6 +207,8 @@ impl Peer {
                     "Sent request {{index: {}, begin: {}, length: {}}}",
                     index, begin, length
                 );
+                request_times.lock().await
+                    .insert((index, begin, length), Instant::now());
             }
             Message::Cancel{ index, begin, length } => {
                 payload.push(8);
@@ -200,7 +219,7 @@ impl Peer {
                     index, begin, length
                 );
             }
-            Message::Piece{ index, begin, piece } => {
+            Message::Piece{ index, begin, piece, .. } => {
                 payload.push(7);
                 send_index_begin(&mut payload, index, begin);
                 let piece_length = piece.len();
@@ -241,7 +260,11 @@ impl Peer {
         Ok(())
     }
 
-    async fn receive(reader: &mut OwnedReadHalf, name: &str) -> Result<Message> {
+    async fn receive(
+        reader: &mut OwnedReadHalf,
+        name: &str,
+        request_times: RequestTimes,
+    ) -> Result<Message> {
         let mut int_buf = [0u8; 4];
         reader.read_exact(&mut int_buf).await?;
         let message_length = u32::from_be_bytes(int_buf) as usize;
@@ -304,11 +327,17 @@ impl Peer {
                 let (index, begin) = receive_index_begin(reader).await?;
                 let mut piece = vec![0u8; message_length - 1 - 4 - 4];
                 reader.read_exact(&mut piece).await?;
+
+                let key = (index, begin, piece.len());
+                let sent_at = request_times.lock().await
+                    .remove(&key);
+                let response_time = sent_at.map(|t| t.elapsed());
+
                 trace!(peer = %name,
                     "Received piece {{index: {}, begin: {}, length: {}}}",
                     index, begin, piece.len()
                 );
-                Ok(Message::Piece { index, begin, piece })
+                Ok(Message::Piece { index, begin, piece, response_time })
             }
             8 => { // cancel
                 anyhow::ensure!(
@@ -343,6 +372,7 @@ impl Peer {
             2 => {
                 anyhow::ensure!(
                     message_length == 1,
+
                     "The length of an intereseted payload should be 1, got {message_length}"
                 );
                 trace!(peer = %name, "Received interested");

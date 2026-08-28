@@ -251,7 +251,7 @@ impl Trackers {
 
             if discovered {
                 let _ = self.tx.send(torrent::Event::Discovery(self.peers.clone())).await;
-                info!("Successfully announced\n{self}");
+                info!(tier = &t, "Successfully announced\n{self}");
                 return;
             }
         }
