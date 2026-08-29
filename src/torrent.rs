@@ -1,26 +1,31 @@
 use anyhow::Result;
 use tokio::{
     fs,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, debug, Instrument, Span};
 use std::{
-    collections::HashMap, path::PathBuf, sync::mpsc::RecvTimeoutError::Disconnected, time::Duration
+    collections::HashMap,
+    path::{PathBuf, Path},
+    sync::mpsc::RecvTimeoutError::Disconnected,
+    time::Duration
 };
 
 use crate::{
     bitfield::PieceBitfield,
     metainfo::Metainfo,
-    peer::{Peer,Message,PeerId},
-    tracker::{PeerInfo, Trackers, Progress},
-    timer::Timer,
+    peer::{Message::{self, Bitfield}, Peer, PeerId},
     piece::Piece,
-    util::pretty_size,
+    timer::Timer,
+    tracker::{PeerInfo, Progress, Trackers},
+    util::pretty_size
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
 
-const DEFAULT_MAX_REQUESTS: usize = 10;
+const DEFAULT_MAX_REQUESTS: usize = 20;
 const MIN_MAX_REQUESTS: usize = 5;
 const MAX_MAX_REQUESTS: usize = 70;
 const MAX_REQUESTS_STEP: usize = 2;
@@ -43,6 +48,7 @@ pub struct Connection {
     tx: mpsc::Sender<Message>,
     max_requests: usize,
 
+    client: Option<String>,
     downloaded_this_second: usize,
     last_download_rate: usize,
     response_times_sum: Duration,
@@ -62,6 +68,7 @@ impl Connection {
             info: info.clone(),
             max_requests: DEFAULT_MAX_REQUESTS,
 
+            client: None,
             downloaded_this_second: 0,
             last_download_rate: 0,
             num_response_times: 0,
@@ -97,20 +104,37 @@ impl Torrent {
         let metainfo = Metainfo::from_bytes(&file)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         {}
+        info!("Parsed metainfo:\n{}", metainfo);
         let span = tracing::info_span!(
             "torrent",
             name = %metainfo.name,
         );
         let _enter = span.enter();
 
-        info!("Parsed metainfo:\n{}", metainfo);
+        let mut pieces = vec![];
+        let path = Path::new("torrents").join(format!("{}.state", metainfo.name));
+        let mut downloaded_pieces = 0;
+        if fs::try_exists(&path).await? {
+            info!("Recovering");
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path).await?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+            let bitfield = PieceBitfield::from_vec(bytes);
+            for p in 0..metainfo.num_pieces {
+                let written = bitfield.has_piece(p);
+                if written {
+                    downloaded_pieces += 1;
+                }
+                pieces.push(Piece::new(&metainfo, p, written));
+            }
+        }
 
         let (tx, rx) = mpsc::channel(100);
 
-        let mut pieces = vec![];
-        for p in 0..metainfo.num_pieces {
-            pieces.push(Piece::new(&metainfo, p));
-        }
 
         let (tracker_tx, tracker_rx) = mpsc::channel(10);
         let trackers = Trackers::from_metainfo(
@@ -133,15 +157,16 @@ impl Torrent {
             span: span.clone(),
             client_id: client_id.clone(),
 
-            downloaded_pieces: 0,
+            downloaded_pieces,
         })
     }
 
-    pub async fn download(&mut self) -> Result<()> {
+    pub async fn run(&mut self, token: CancellationToken) -> Result<()> {
         let span = tracing::info_span!(
             "torrent",
             name = %self.metainfo.name,
         );
+
 
         async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -153,9 +178,32 @@ impl Torrent {
                     _ = interval.tick() => {
                         self.tick().await?;
                     }
+                    _ = token.cancelled() => {
+                        self.save_state().await?;
+                        break;
+                    }
                 }
             }
+            Ok(())
         }.instrument(span).await
+    }
+
+    pub async fn save_state(&self) -> Result<()> {
+        info!("Saving");
+        let mut bitfield = PieceBitfield::new(self.metainfo.num_pieces);
+        for (p, piece) in self.pieces.iter().enumerate() {
+            if piece.is_written() {
+                bitfield.set_piece(p);
+            }
+        }
+        let path = Path::new("torrents").join(format!("{}.state", self.metainfo.name));
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path).await?;
+        file.write_all(bitfield.as_bytes()).await?;
+        Ok(())
     }
 
     pub async fn request_block(
@@ -249,14 +297,12 @@ impl Torrent {
     }
 
     fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
-        const LABEL_WIDTH: usize = 100;
-
         let mut status = String::new();
         let mut downloaded_this_second = 0;
 
         for (peer_id, connection) in self.connections.iter_mut() {
             status.push_str(
-                &format!("    {:<LABEL_WIDTH$} {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s\n",
+                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} \n",
                     connection.info,
                     if connection.choked {'C'} else {'U'},
                     if connection.interested {'I'} else {'-'},
@@ -266,14 +312,15 @@ impl Torrent {
                     connection.response_times_sum.as_secs_f64() * 1000.
                         / connection.num_response_times as f64,
                     timeouts_this_second.get(peer_id).unwrap_or(&0),
-                    connection.chokes_this_second));
+                    connection.chokes_this_second,
+                    connection.client.as_ref().unwrap_or(&String::new())));
 
-            if connection.last_download_rate > connection.downloaded_this_second {
+            if (connection.last_download_rate as f64) > connection.downloaded_this_second as f64 * 1.3f64 {
                 // restrict pipeline
                 connection.max_requests = (connection.max_requests - MAX_REQUESTS_STEP)
                     .max(MIN_MAX_REQUESTS);
             }
-            else if connection.last_download_rate < connection.downloaded_this_second {
+            else {
                 // open pipeline
                 connection.max_requests = (connection.max_requests + MAX_REQUESTS_STEP)
                     .min(MAX_MAX_REQUESTS);
@@ -301,6 +348,11 @@ impl Torrent {
         for piece in self.pieces.iter_mut() {
             for (peer_id, count) in piece.check_timeout() {
                 *timeouts_this_second.entry(peer_id).or_insert(0) += count;
+                
+                if let Some(connection) = self.connections.get_mut(&peer_id) {
+                    connection.sent_requests =
+                        connection.sent_requests.saturating_sub(count);
+                }
             }
         }
 
@@ -421,6 +473,8 @@ impl Torrent {
                                 index
                             );
                             let block_index = begin / BLOCK_SIZE;
+                            connection.sent_requests =
+                                connection.sent_requests.saturating_sub(1);
                             debug!("Got rejection for block {index}:{block_index}");
                         }
 
@@ -428,6 +482,15 @@ impl Torrent {
                         Message::KeepAlive => {}
                         Message::Unsupported { type_byte } => {
                             warn!("Handle unsupported message {type_byte}");
+                        }
+
+                        Message::ExtensionHandshake { extensions, client, max_requests } => {
+                            debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
+                            connection.client = client;
+                        }
+
+                        Message::Pex { added, dropped } => {
+                            warn!("Got PEX {added:?} {dropped:?}");
                         }
                     }
                 }
@@ -441,7 +504,7 @@ impl Torrent {
                     Connection::new(tx, self.metainfo.num_pieces, &info),
                 );
                 tokio::spawn(peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone()));
-                info!(peer = %info,"Connected with interest");
+                debug!(peer = %info,"Connected with interest");
             }
 
             Event::ConnectionFailure(peer_info, e) => {

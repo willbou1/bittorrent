@@ -18,6 +18,10 @@ use peer::PeerId;
 use bencode::BencodeValue;
 use tracing_subscriber::{EnvFilter, fmt};
 use rand::Rng;
+use tokio::{
+    signal,
+};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
@@ -41,9 +45,17 @@ async fn main() {
             let mut client_id: PeerId = [0; 20];
             rand::rng().fill_bytes(&mut client_id);
             println!("Client id: {}", client_id.map(|b| format!("{b:02x}")).join(""));
-            let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second), &client_id).await.unwrap();
             if command == "download" {
-                torrent.download().await;
+                let token = CancellationToken::new();
+                let token_clone = token.clone();
+                let second = args[2].clone();
+                let task = tokio::spawn( async move {
+                    let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second), &client_id).await.unwrap();
+                    torrent.run(token_clone).await;
+                });
+                let _ = signal::ctrl_c().await;
+                token.cancel();
+                let _ = tokio::join!(task);
             }
         }
         "decode" => {

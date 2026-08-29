@@ -221,10 +221,14 @@ impl Trackers {
     }
 
     async fn announce(&mut self) {
+        const ANNOUNCE_TO_ALL_TIERS: bool = true;
+        
         let mut discovered = false;
 
         for t in 0..self.urls.len() {
-            self.reset();
+            if !ANNOUNCE_TO_ALL_TIERS {
+                self.reset();
+            }
             
             let mut good = Vec::new();
             let mut bad = Vec::new();
@@ -252,11 +256,11 @@ impl Trackers {
             if discovered {
                 let _ = self.tx.send(torrent::Event::Discovery(self.peers.clone())).await;
                 info!(tier = &t, "Successfully announced\n{self}");
-                return;
+                if !ANNOUNCE_TO_ALL_TIERS {
+                    return;
+                }
             }
         }
-
-        warn!("No tracker to announce to");
     }
 
     async fn request_udp(

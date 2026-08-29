@@ -54,7 +54,7 @@ pub struct Piece {
 }
 
 impl Piece {
-    pub fn new(metainfo: &Metainfo, index: usize) -> Self {
+    pub fn new(metainfo: &Metainfo, index: usize, written: bool) -> Self {
         let length = metainfo.piece_length(index);
         let num_blocks = length.div_ceil(BLOCK_SIZE);
         let files = metainfo.piece_files[index]
@@ -72,7 +72,7 @@ impl Piece {
             blocks: vec![Block::Unobtained; num_blocks],
             downloaded_blocks: 0,
             downloading_blocks: 0,
-            written: false,
+            written,
             hash: metainfo.pieces[index],
             length,
             files,
@@ -242,5 +242,4 @@ impl Piece {
         }
         Ok(false)
     }
-
 }

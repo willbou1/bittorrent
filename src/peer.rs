@@ -11,14 +11,18 @@ use std::{
     collections::HashMap,
     sync::Arc,
     time::{Instant, Duration},
+    net::{Ipv4Addr, Ipv6Addr},
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::{
     tracker::PeerInfo,
     bitfield::PieceBitfield,
     torrent::{Event},
+    bencode::BencodeValue,
 };
+
+const PEX_ID: u8 = 1;
 
 #[derive(Debug)]
 pub enum Message {
@@ -28,11 +32,6 @@ pub enum Message {
     Bitfield(PieceBitfield),
     Have {
         index: usize,
-    },
-    Reject {
-        index: usize,
-        begin: usize,
-        length: usize,
     },
     Request {
         index: usize,
@@ -50,9 +49,96 @@ pub enum Message {
         piece: Vec<u8>,
         response_time: Option<Duration>,
     },
+
+    // BEP 6: https://www.bittorrent.org/beps/bep_0006.html
+    Reject {
+        index: usize,
+        begin: usize,
+        length: usize,
+    },
+
+    // BEP 10: https://bittorrent.org/beps/bep_0010.html
+    ExtensionHandshake {
+        extensions: HashMap<String, u8>,
+        client: Option<String>,
+        max_requests: Option<usize>,
+    },
+
+    // BEP 11: https://www.bittorrent.org/beps/bep_0011.html#bep-40
+    Pex {
+        added: Vec<(Ipv4Addr, Option<u8>)>,
+        dropped: Vec<Ipv4Addr>,
+    },
+
     Unsupported {
         type_byte: u8,
     },
+}
+
+impl Message {
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::ExtensionHandshake { extensions, client, max_requests } => {
+                let mut root = HashMap::new();
+                if let Some(client) = client {
+                    root.insert("v".to_string(),
+                        BencodeValue::ByteString(client.into_bytes())
+                    );
+                }
+                if let Some(max_requests) = max_requests {
+                    root.insert("reqq".to_string(),
+                        BencodeValue::Integer(max_requests as i64)
+                    );
+                }
+                root.insert("m".to_string(), BencodeValue::Dictionary(
+                    extensions.iter()
+                        .map(|(name, id)| (name.clone(), BencodeValue::Integer(*id as i64)))
+                        .collect()
+                ));
+                BencodeValue::Dictionary(root).to_bytes()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn from_extension_handshake_bytes(encoded: &[u8]) -> Result<Self, String> {
+        let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
+            || "Unable to find root dictionary"
+        )?;
+
+        Ok(Self::ExtensionHandshake {
+            extensions: root.required("m")?.as_dict().ok_or_else(|| "'m' must be a dictionary")?
+                .iter().map(
+                    |(name, id)| Ok((name.clone(), id.unsigned(name)? as u8))
+                ).collect::<Result<HashMap<_, _>, String>>()?,
+            client: root.optional_string("v")?,
+            max_requests: root.optional_unsigned("reqq")?.map(|m| m as usize),
+        })
+    }
+
+    pub fn from_pex_bytes(encoded: &[u8]) -> Result<Self, String> {
+        let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
+            || "Unable to find root dictionary"
+        )?;
+
+        let added: Vec<_> = root.required_bytes("added")?
+            .chunks(6).map(
+                |addr| Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3])
+            ).collect();
+        let flags = root.optional_bytes("added.f")?;
+
+        let dropped: Vec<_> = root.required_bytes("dropped")?
+            .chunks(6).map(
+                |addr| Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3])
+            ).collect();
+
+        Ok(Self::Pex {
+            added: added.iter().enumerate().map(
+                |(a, addr)| (addr.clone(), flags.as_ref().map(|f| f[a]))
+            ).collect(),
+            dropped,
+        })
+    }
 }
 
 pub type PeerId = [u8; 20];
@@ -82,7 +168,10 @@ impl Peer {
         // Send the handshake
         handshake[0] = 19;
         handshake[1..20].copy_from_slice(b"BitTorrent protocol");
-        handshake[20..28].fill(0);
+        handshake[20..28].copy_from_slice(
+            &0x00_00_00_00_00_10_00_00u64.to_be_bytes()
+        ); // Enable extension support
+        handshake[26..28].fill(0);
         handshake[28..48].copy_from_slice(info_hash);
         handshake[48..68].copy_from_slice(local_id);
         stream.write_all(&handshake).await?;
@@ -153,6 +242,15 @@ impl Peer {
         };
         
         let writer_task = async move {
+            // Send extension handshake
+            Self::send(&mut writer, &name, Message::ExtensionHandshake {
+                extensions: HashMap::from_iter(vec![
+                    (String::from("ut_pex"), PEX_ID)
+                ]),
+                client: Some(String::from("custom")),
+                max_requests: Some(70)
+            }, write_request_times.clone()).await?;
+
             while let Some(message) = rx.recv().await {
                 Self::send(&mut writer, &name, message, write_request_times.clone()).await?;
             }
@@ -251,6 +349,12 @@ impl Peer {
 
             Message::KeepAlive => {}
             Message::Unsupported { .. } => {}
+            msg @ Message::ExtensionHandshake { .. } => {
+                payload.push(20);
+                payload.push(0);
+                payload.extend(msg.into_bytes());
+            }
+            Message::Pex { .. } => {}
         }
 
         let length = u32::try_from(payload.len())?;
@@ -387,7 +491,6 @@ impl Peer {
                 Ok(Message::Interested(false))
             }
 
-            // extensions
             16 => { // reject
                 anyhow::ensure!(
                     message_length == 1 + 4 + 4 + 4,
@@ -401,6 +504,26 @@ impl Peer {
                     index, begin, length
                 );
                 Ok(Message::Reject { index, begin, length })
+            }
+
+            // extensions
+            20 => {
+                let mut payload = vec![0u8; message_length - 1];
+                reader.read_exact(&mut payload).await?;
+                trace!(peer = %name,
+                    "Received extension {{id: {}}}",
+                    payload[0],
+                );
+                match payload[0] {
+                    0 => {
+                        let msg = Message::from_extension_handshake_bytes(&payload[1..])
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Ok(msg)
+                    }
+                    PEX_ID => Message::from_pex_bytes(&payload[1..])
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                    _ => Ok(Message::Unsupported { type_byte: payload[0] + 20 }),
+                }
             }
 
             _ => {

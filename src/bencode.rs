@@ -240,6 +240,15 @@ impl BencodeValue {
             .map(|s| s.to_vec())
     }
 
+    pub fn optional_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        match self.get(key) {
+            Some(bytes) => bytes
+                .as_bytes().ok_or_else(|| format!("'{key}' must be a byte string"))
+                .map(|s| Some(s.to_vec())),
+            None => Ok(None),
+        }
+    }
+
     pub fn required_string(&self, key: &str) -> Result<String, String> {
         self.required(key)?
             .as_str().ok_or_else(|| format!("'{key}' must be a UTF-8 string"))
