@@ -23,6 +23,7 @@ use rand::Rng;
 pub struct Progress {
     pub downloaded: usize,
     pub uploaded: usize,
+    pub left: usize,
     pub event: Event,
 }
 
@@ -86,7 +87,6 @@ pub struct Trackers {
     client_id: PeerId,
     tx: mpsc::Sender<torrent::Event>,
     rx: mpsc::Receiver<Progress>,
-    length: usize,
 
     pub interval: Option<u64>,
     pub min_interval: Option<u64>,
@@ -96,30 +96,28 @@ pub struct Trackers {
 
     uploaded: usize,
     downloaded: usize,
+    left: usize,
     event: Event,
 }
 
 impl Trackers {
-    pub fn from_metainfo(
+    pub fn new(
         tx: mpsc::Sender<torrent::Event>,
         rx: mpsc::Receiver<Progress>,
-        client_id: &PeerId,
-        metainfo: &Metainfo,
-        downloaded: usize,
-        uploaded: usize,
+        client_id: PeerId,
+        info_hash: InfoHash,
+        mut urls: Vec<Vec<String>>,
     ) -> Self {
-        let mut urls = metainfo.announces.to_vec();
         for tier_urls in urls.iter_mut() {
             tier_urls.shuffle(&mut rand::rng());
         }
         
         Self {
             urls,
-            info_hash: metainfo.info_hash,
-            client_id: client_id.clone(),
+            info_hash,
+            client_id,
             tx,
             rx,
-            length: metainfo.length,
 
             interval: None,
             min_interval: None,
@@ -127,8 +125,9 @@ impl Trackers {
             leechers: None,
             peers: Vec::new(),
 
-            downloaded,
-            uploaded,
+            downloaded: 0,
+            uploaded: 0,
+            left: 0,
             event: Event::None,
         }
     }
@@ -298,7 +297,7 @@ impl Trackers {
             &(self.downloaded as i64).to_be_bytes()
         );
         request[64..72].copy_from_slice(
-            &(self.length as i64 - self.downloaded as i64).to_be_bytes()
+            &(self.left as i64).to_be_bytes()
         );
         request[72..80].copy_from_slice(
             &(self.uploaded as i64).to_be_bytes()
@@ -366,7 +365,7 @@ impl Trackers {
             query.append_pair("port", "6881");
             query.append_pair("uploaded", &self.uploaded.to_string());
             query.append_pair("downloaded", &self.downloaded.to_string());
-            query.append_pair("left", &(self.length - self.downloaded).to_string());
+            query.append_pair("left", &self.left.to_string());
             if !matches!(self.event, Event::None) {
                 query.append_pair("event", self.event.to_string());
             }

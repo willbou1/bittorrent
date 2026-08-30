@@ -13,7 +13,7 @@ use tokio::{
 use tracing::{info, warn, debug, trace};
 
 use crate::{
-    metainfo::{Metainfo, PieceFile},
+    metainfo::{Metadata, PieceFile},
     timer::Timer,
     types::*,
 };
@@ -54,17 +54,17 @@ pub struct Piece {
 }
 
 impl Piece {
-    pub fn new(metainfo: &Metainfo, index: usize, written: bool) -> Self {
-        let length = metainfo.piece_length(index);
+    pub fn new(metadata: &Metadata, index: usize, written: bool) -> Self {
+        let length = metadata.piece_length(index);
         let num_blocks = length.div_ceil(BLOCK_SIZE);
-        let files = metainfo.piece_files[index]
+        let files = metadata.piece_files[index]
             .iter()
             .map(|pf| File {
                 length: pf.length,
                 file_offset: pf.file_offset,
                 piece_offset: pf.piece_offset,
-                path: metainfo.files[pf.file_index].path.clone(),
-                file_length: metainfo.files[pf.file_index].length,
+                path: metadata.files[pf.file_index].path.clone(),
+                file_length: metadata.files[pf.file_index].length,
             })
             .collect();
 
@@ -73,7 +73,7 @@ impl Piece {
             downloaded_blocks: 0,
             downloading_blocks: 0,
             written,
-            hash: metainfo.pieces[index],
+            hash: metadata.pieces[index],
             length,
             files,
             index,

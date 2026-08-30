@@ -5,7 +5,6 @@ mod peer;
 mod bitfield;
 mod torrent;
 mod timer;
-mod piece;
 mod util;
 mod types;
 
@@ -23,7 +22,6 @@ use tokio::{
     signal,
 };
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
 #[tokio::main]
 async fn main() {
@@ -52,17 +50,6 @@ async fn main() {
             let uri = args[2].clone();
 
             if uri.starts_with("magnet:?") {
-                let url = Url::parse(&uri).unwrap();
-                let mut pairs = url.query_pairs();
-                let xt = pairs.find(|(n, _)| n == "xt").unwrap();
-                let dn = pairs.find(|(n, _)| n == "dn").unwrap();
-                let display_name = dn.1;
-
-                let info_hash = InfoHash::from_xt(&xt.1).unwrap();
-                let trackers: Vec<_> = pairs.filter(|(n, _)| n == "tr")
-                    .map(|(_, v)| v).collect();
-
-                println!("{info_hash} {display_name} {trackers:?}");
                 return;
             }
 
