@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::{
     net::{
         TcpStream,
@@ -8,21 +8,21 @@ use tokio::{
     sync::mpsc,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Instant, Duration},
-    net::{Ipv4Addr, Ipv6Addr},
 };
 use tracing::{trace, warn};
 
 use crate::{
-    tracker::PeerInfo,
     bitfield::PieceBitfield,
     torrent::{Event},
     bencode::BencodeValue,
+    types::*,
 };
 
 const PEX_ID: u8 = 1;
+const METADATA_ID: u8 = 2;
 
 #[derive(Debug)]
 pub enum Message {
@@ -62,12 +62,26 @@ pub enum Message {
         extensions: HashMap<String, u8>,
         client: Option<String>,
         max_requests: Option<usize>,
+        metadata_size: Option<usize>,
     },
 
     // BEP 11: https://www.bittorrent.org/beps/bep_0011.html#bep-40
     Pex {
-        added: Vec<(Ipv4Addr, Option<u8>)>,
-        dropped: Vec<Ipv4Addr>,
+        added: Vec<PeerInfo>,
+        dropped: Vec<PeerEndpoint>,
+    },
+
+    // BEP 9: https://www.bittorrent.org/beps/bep_0009.html 
+    MetadataRequest {
+        index: usize,
+    },
+    MetadataReject {
+        index: usize,
+    },
+    Metadata {
+        index: usize,
+        total_size: usize,
+        piece: Vec<u8>,
     },
 
     Unsupported {
@@ -78,7 +92,7 @@ pub enum Message {
 impl Message {
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
-            Self::ExtensionHandshake { extensions, client, max_requests } => {
+            Self::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
                 let mut root = HashMap::new();
                 if let Some(client) = client {
                     root.insert("v".to_string(),
@@ -90,11 +104,37 @@ impl Message {
                         BencodeValue::Integer(max_requests as i64)
                     );
                 }
+                if let Some(metadata_size) = metadata_size {
+                    root.insert("metadata_size".to_string(),
+                        BencodeValue::Integer(metadata_size as i64)
+                    );
+                }
                 root.insert("m".to_string(), BencodeValue::Dictionary(
                     extensions.iter()
                         .map(|(name, id)| (name.clone(), BencodeValue::Integer(*id as i64)))
                         .collect()
                 ));
+                BencodeValue::Dictionary(root).to_bytes()
+            }
+            Self::MetadataRequest { index } => {
+                let mut root = HashMap::new();
+                root.insert("msg_type".to_string(), BencodeValue::Integer(0));
+                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
+                BencodeValue::Dictionary(root).to_bytes()
+            }
+            Self::Metadata { index, total_size, piece } => {
+                let mut root = HashMap::new();
+                root.insert("msg_type".to_string(), BencodeValue::Integer(0));
+                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
+                root.insert("total_size".to_string(), BencodeValue::Integer(total_size as i64));
+                let mut ret = BencodeValue::Dictionary(root).to_bytes();
+                ret.extend(piece);
+                ret
+            }
+            Self::MetadataReject { index } => {
+                let mut root = HashMap::new();
+                root.insert("msg_type".to_string(), BencodeValue::Integer(2));
+                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
                 BencodeValue::Dictionary(root).to_bytes()
             }
             _ => Vec::new(),
@@ -113,6 +153,7 @@ impl Message {
                 ).collect::<Result<HashMap<_, _>, String>>()?,
             client: root.optional_string("v")?,
             max_requests: root.optional_unsigned("reqq")?.map(|m| m as usize),
+            metadata_size: root.optional_unsigned("metadata_size")?.map(|s| s as usize),
         })
     }
 
@@ -121,29 +162,76 @@ impl Message {
             || "Unable to find root dictionary"
         )?;
 
-        let added: Vec<_> = root.required_bytes("added")?
-            .chunks(6).map(
-                |addr| Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3])
-            ).collect();
-        let flags = root.optional_bytes("added.f")?;
+        let mut added = Vec::new();
+        let mut dropped = Vec::new();
 
-        let dropped: Vec<_> = root.required_bytes("dropped")?
-            .chunks(6).map(
-                |addr| Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3])
-            ).collect();
+        let flags4 = root.optional_bytes("added.f")?;
+        let flags6 = root.optional_bytes("added6.f")?;
+
+        added.extend(
+            PeerEndpoint::from_compact_4(
+                &root.required_bytes("added")?
+            ).into_iter().enumerate().map(|(e, endpoint)| PeerInfo {
+                endpoints: HashSet::from_iter(vec![endpoint]),
+                id: None,
+                flags: flags4.as_ref().map(|f| f[e]),
+            })
+        );
+
+        added.extend(
+            PeerEndpoint::from_compact_6(
+                &root.required_bytes("added6")?
+            ).into_iter().enumerate().map(|(e, endpoint)| PeerInfo {
+                endpoints: HashSet::from_iter(vec![endpoint]),
+                id: None,
+                flags: flags6.as_ref().map(|f| f[e]),
+            })
+        );
+
+        dropped.extend(
+            PeerEndpoint::from_compact_4(
+                &root.required_bytes("dropped")?
+            )
+        );
+
+        dropped.extend(
+            PeerEndpoint::from_compact_6(
+                &root.required_bytes("dropped6")?
+            )
+        );
 
         Ok(Self::Pex {
-            added: added.iter().enumerate().map(
-                |(a, addr)| (addr.clone(), flags.as_ref().map(|f| f[a]))
-            ).collect(),
+            added,
             dropped,
+        })
+    }
+
+    pub fn from_metadata_bytes(encoded: &[u8]) -> Result<Self, String> {
+        let decoded = BencodeValue::from_bytes(encoded)?;
+        let root = decoded.0.ok_or_else(
+            || "Unable to find root dictionary"
+        )?;
+
+        Ok(match root.required_unsigned("msg_type")? {
+            0 => Self::MetadataRequest {
+                index: root.required_unsigned("piece")? as usize,
+            },
+            1 => Self::Metadata {
+                index: root.required_unsigned("piece")? as usize,
+                total_size: root.required_unsigned("total_size")? as usize,
+                piece: decoded.1.to_vec(),
+            },
+            2 => Self::MetadataRequest {
+                index: root.required_unsigned("piece")? as usize,
+            },
+            _ => Self::Unsupported { type_byte: 20 + METADATA_ID },
         })
     }
 }
 
-pub type PeerId = [u8; 20];
 type RequestKey = (usize, usize, usize);
 type RequestTimes = Arc<tokio::sync::Mutex<HashMap<RequestKey, Instant>>>;
+type ExtensionMapping = Arc<tokio::sync::Mutex<HashMap<String, u8>>>;
 
 pub struct Peer {
     pub stream: TcpStream,
@@ -154,14 +242,16 @@ pub struct Peer {
 impl Peer {
     pub async fn handshake(
         peer_info: &PeerInfo,
-        info_hash: &[u8; 20],
+        info_hash: &InfoHash,
         local_id: &PeerId,
     ) -> Result<Self> {
         let mut handshake = [0u8; 68];
         let name = format!("{peer_info}");
 
+        let addrs = peer_info.resolve().await?;
+
         let mut stream = TcpStream::connect(
-            format!("{}:{}", peer_info.host, peer_info.port)
+            addrs.iter().next().unwrap()
         ).await?;
         trace!(peer = %name, "Connected");
 
@@ -172,8 +262,8 @@ impl Peer {
             &0x00_00_00_00_00_10_00_00u64.to_be_bytes()
         ); // Enable extension support
         handshake[26..28].fill(0);
-        handshake[28..48].copy_from_slice(info_hash);
-        handshake[48..68].copy_from_slice(local_id);
+        handshake[28..48].copy_from_slice(info_hash.as_bytes());
+        handshake[48..68].copy_from_slice(local_id.as_bytes());
         stream.write_all(&handshake).await?;
         trace!(peer = %name, "Sent handshake");
 
@@ -188,12 +278,12 @@ impl Peer {
             "expected handshake response to have 'BitTorrent protocol'"
         );
         anyhow::ensure!(
-            &handshake[28..48] == info_hash,
+            &handshake[28..48] == info_hash.as_bytes(),
             "expected handshake response to have same info hash"
         );
         if let Some(peer_id) = peer_info.id {
             anyhow::ensure!(
-                handshake[48..68] == peer_id,
+                &handshake[48..68] == peer_id.as_bytes(),
                 "expected handshake response to have right peer id"
             );
         }
@@ -202,7 +292,7 @@ impl Peer {
         Ok(Self {
             stream,
             name,
-            id: handshake[48..68].try_into()?,
+            id: PeerId::from(handshake[48..68].try_into()?),
         })
     }
 
@@ -218,8 +308,11 @@ impl Peer {
         } = self;
         
         let request_times = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let extensions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let read_request_times = request_times.clone();
         let write_request_times = request_times.clone();
+        let read_extensions = extensions.clone();
+        let write_extensions = extensions.clone();
 
         let (mut reader, mut writer) = stream.into_split();
         
@@ -228,7 +321,7 @@ impl Peer {
         
         let reader_task = async move {
             loop {
-                match Self::receive(&mut reader, &read_name, read_request_times.clone()).await {
+                match Self::receive(&mut reader, &read_name, read_request_times.clone(), read_extensions.clone()).await {
                     Ok(message) => {
                         if read_tx.send(Event::Message(id, message)).await.is_err() {
                             return Ok(());
@@ -245,14 +338,16 @@ impl Peer {
             // Send extension handshake
             Self::send(&mut writer, &name, Message::ExtensionHandshake {
                 extensions: HashMap::from_iter(vec![
-                    (String::from("ut_pex"), PEX_ID)
+                    (String::from("ut_pex"), PEX_ID),
+                    (String::from("ut_metadata"), METADATA_ID),
                 ]),
                 client: Some(String::from("custom")),
-                max_requests: Some(70)
-            }, write_request_times.clone()).await?;
+                max_requests: Some(70),
+                metadata_size: None,
+            }, write_request_times.clone(), write_extensions.clone()).await?;
 
             while let Some(message) = rx.recv().await {
-                Self::send(&mut writer, &name, message, write_request_times.clone()).await?;
+                Self::send(&mut writer, &name, message, write_request_times.clone(), write_extensions.clone()).await?;
             }
             
             Ok::<_, anyhow::Error>(())
@@ -277,6 +372,7 @@ impl Peer {
         name: &str,
         message: Message,
         request_times: RequestTimes,
+        extensions: ExtensionMapping,
     ) -> Result<()> {
         let mut log = String::new();
         let mut payload = Vec::new();
@@ -354,6 +450,13 @@ impl Peer {
                 payload.push(0);
                 payload.extend(msg.into_bytes());
             }
+            msg @ Message::MetadataRequest { .. } |
+            msg @ Message::MetadataReject { .. } |
+            msg @ Message::Metadata { .. } => {
+                payload.push(20);
+                payload.push(*extensions.lock().await.get("ut_metadata").unwrap());
+                payload.extend(msg.into_bytes());
+            }
             Message::Pex { .. } => {}
         }
 
@@ -368,6 +471,7 @@ impl Peer {
         reader: &mut OwnedReadHalf,
         name: &str,
         request_times: RequestTimes,
+        extensions: ExtensionMapping,
     ) -> Result<Message> {
         let mut int_buf = [0u8; 4];
         reader.read_exact(&mut int_buf).await?;
@@ -518,9 +622,14 @@ impl Peer {
                     0 => {
                         let msg = Message::from_extension_handshake_bytes(&payload[1..])
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        if let Message::ExtensionHandshake { extensions: new, .. } = &msg {
+                            extensions.lock().await.extend(new.clone());
+                        }
                         Ok(msg)
                     }
                     PEX_ID => Message::from_pex_bytes(&payload[1..])
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                    METADATA_ID => Message::from_metadata_bytes(&payload[1..])
                         .map_err(|e| anyhow::anyhow!("{e}")),
                     _ => Ok(Message::Unsupported { type_byte: payload[0] + 20 }),
                 }

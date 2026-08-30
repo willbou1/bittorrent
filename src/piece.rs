@@ -14,8 +14,8 @@ use tracing::{info, warn, debug, trace};
 
 use crate::{
     metainfo::{Metainfo, PieceFile},
-    peer::PeerId,
     timer::Timer,
+    types::*,
 };
 
 type Hash = [u8; 20];

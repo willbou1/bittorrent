@@ -16,11 +16,13 @@ use std::{
 use crate::{
     bitfield::PieceBitfield,
     metainfo::Metainfo,
-    peer::{Message::{self, Bitfield}, Peer, PeerId},
+    types::{InfoHash, PeerId},
+    peer::{Message::{self, Bitfield}, Peer},
     piece::Piece,
     timer::Timer,
-    tracker::{PeerInfo, Progress, Trackers},
-    util::pretty_size
+    tracker::{Progress, Trackers},
+    util::pretty_size,
+    types::*,
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
@@ -361,7 +363,7 @@ impl Torrent {
         self.dispatch_requests().await
     }
 
-    fn connect_success(&self, info: &PeerInfo) {
+    fn begin_connect(&self, info: &PeerInfo) {
         let tx = self.peer_tx.clone();
         let peer_info = info.clone();
         let info_hash = self.metainfo.info_hash.clone();
@@ -484,27 +486,43 @@ impl Torrent {
                             warn!("Handle unsupported message {type_byte}");
                         }
 
-                        Message::ExtensionHandshake { extensions, client, max_requests } => {
+                        Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
                             debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
                             connection.client = client;
                         }
 
                         Message::Pex { added, dropped } => {
                             warn!("Got PEX {added:?} {dropped:?}");
+                            for info in added {
+                                if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
+                                    m.info.merge(info);
+                                } else {
+                                    self.begin_connect(&info);
+                                }
+                            }
                         }
+
+                        Message::MetadataRequest { .. } => (),
+                        Message::Metadata { .. } => (),
+                        Message::MetadataReject { .. } => (),
                     }
                 }
             }
 
-            Event::Connection(peer, info) => {
+            Event::Connection(peer, mut info) => {
                 let (tx, rx) = mpsc::channel(100);
                 tx.send(Message::Interested(true)).await?;
-                self.connections.insert(
-                    peer.id,
-                    Connection::new(tx, self.metainfo.num_pieces, &info),
-                );
-                tokio::spawn(peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone()));
+                info.id = Some(peer.id);
                 debug!(peer = %info,"Connected with interest");
+                if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
+                    m.info.merge(info.clone());
+                } else {
+                    self.connections.insert(
+                        info.id.unwrap(),
+                        Connection::new(tx, self.metainfo.num_pieces, &info),
+                    );
+                    tokio::spawn(peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone()));
+                }
             }
 
             Event::ConnectionFailure(peer_info, e) => {
@@ -522,8 +540,10 @@ impl Torrent {
             Event::Discovery(peer_infos) => {
                 info!("Discovered peers");
                 for info in peer_infos {
-                    if self.connections.iter().all(|(id, c)| c.info != info) {
-                       self.connect_success(&info);
+                    if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
+                        m.info.merge(info);
+                    } else {
+                       self.begin_connect(&info);
                     }
                 }
             }

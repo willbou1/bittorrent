@@ -7,6 +7,7 @@ mod torrent;
 mod timer;
 mod piece;
 mod util;
+mod types;
 
 use std::{
     path::PathBuf,
@@ -14,14 +15,15 @@ use std::{
 };
 
 use torrent::Torrent;
-use peer::PeerId;
 use bencode::BencodeValue;
+use types::{InfoHash, PeerId};
+
 use tracing_subscriber::{EnvFilter, fmt};
-use rand::Rng;
 use tokio::{
     signal,
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 #[tokio::main]
 async fn main() {
@@ -41,22 +43,36 @@ async fn main() {
     let second = &args[2];
 
     match command.as_str() {
-        "info" | "download" => {
-            let mut client_id: PeerId = [0; 20];
-            rand::rng().fill_bytes(&mut client_id);
-            println!("Client id: {}", client_id.map(|b| format!("{b:02x}")).join(""));
-            if command == "download" {
-                let token = CancellationToken::new();
-                let token_clone = token.clone();
-                let second = args[2].clone();
-                let task = tokio::spawn( async move {
-                    let mut torrent = Torrent::from_torrent_file(&PathBuf::from(second), &client_id).await.unwrap();
-                    torrent.run(token_clone).await;
-                });
-                let _ = signal::ctrl_c().await;
-                token.cancel();
-                let _ = tokio::join!(task);
+        "download" => {
+            let mut client_id = PeerId::random();
+            println!("Client id: {client_id}");
+
+            let token = CancellationToken::new();
+            let token_clone = token.clone();
+            let uri = args[2].clone();
+
+            if uri.starts_with("magnet:?") {
+                let url = Url::parse(&uri).unwrap();
+                let mut pairs = url.query_pairs();
+                let xt = pairs.find(|(n, _)| n == "xt").unwrap();
+                let dn = pairs.find(|(n, _)| n == "dn").unwrap();
+                let display_name = dn.1;
+
+                let info_hash = InfoHash::from_xt(&xt.1).unwrap();
+                let trackers: Vec<_> = pairs.filter(|(n, _)| n == "tr")
+                    .map(|(_, v)| v).collect();
+
+                println!("{info_hash} {display_name} {trackers:?}");
+                return;
             }
+
+            let task = tokio::spawn( async move {
+                let mut torrent = Torrent::from_torrent_file(&PathBuf::from(uri), &client_id).await.unwrap();
+                torrent.run(token_clone).await;
+            });
+            let _ = signal::ctrl_c().await;
+            token.cancel();
+            let _ = tokio::join!(task);
         }
         "decode" => {
             let decoded_value = BencodeValue::from_bytes(second.as_bytes()).unwrap_or_else(

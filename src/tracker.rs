@@ -15,8 +15,8 @@ use tokio::{
 use crate::{
     bencode::BencodeValue,
     metainfo::Metainfo,
-    peer::PeerId,
-    torrent
+    torrent,
+    types::*,
 };
 use rand::Rng;
 
@@ -45,46 +45,6 @@ impl Event {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-pub struct PeerInfo {
-    pub id: Option<[u8; 20]>,
-    pub host: String,
-    pub port: u16,
-}
-
-impl PeerInfo {
-    fn from_bencode_value(root: &BencodeValue) -> Result<Vec<Self>, String> {
-        match root {
-            BencodeValue::List(peers) => {
-                peers.iter().map(|peer| Ok(Self {
-                    id: Some(peer.required_bytes("peer id")?.try_into().map_err(
-                        |_| "'id' needs to be 20 bytes long"
-                    )?),
-                    host: peer.required_string("ip")?,
-                    port: peer.required_unsigned("port")?.try_into().map_err(
-                        |_| ""
-                    )?,
-                }))
-                    .collect::<Result<_, _>>()
-            },
-            BencodeValue::ByteString(peers) => {
-                Ok(Self::from_compact(peers))
-            },
-            _ => Err(format!("'peers' must be either a list or a byte string")),
-        }
-    }
-
-    fn from_compact(compact: &[u8]) -> Vec<Self> {
-        compact.chunks(6)
-            .map(|peer| Self {
-                id: None,
-                host: peer[0..4].iter().map(u8::to_string)
-                    .collect::<Vec<_>>().join("."),
-                port: ((peer[4] as u16) << 8) | peer[5] as u16,
-            })
-            .collect()
-    }
-}
 
 struct TrackerResponse {
     pub interval: u64,
@@ -105,7 +65,7 @@ impl TrackerResponse {
             min_interval: root.optional_unsigned("min interval")?,
             seeders: root.optional_unsigned("complete")?,
             leechers: root.optional_unsigned("incomplete")?,
-            peers: PeerInfo::from_bencode_value(root.required("peers")?)?,
+            peers: PeerInfo::from_tracker_bencode(root.required("peers")?)?,
         })
     }
 
@@ -122,7 +82,7 @@ impl TrackerResponse {
 
 pub struct Trackers {
     urls: Vec<Vec<String>>,
-    info_hash: [u8; 20],
+    info_hash: InfoHash,
     client_id: PeerId,
     tx: mpsc::Sender<torrent::Event>,
     rx: mpsc::Receiver<Progress>,
@@ -332,8 +292,8 @@ impl Trackers {
             &1i32.to_be_bytes()
         ); // action: announce
         rand::rng().fill_bytes(&mut request[12..16]);
-        request[16..36].copy_from_slice(&self.info_hash);
-        request[36..56].copy_from_slice(&self.client_id);
+        request[16..36].copy_from_slice(self.info_hash.as_bytes());
+        request[36..56].copy_from_slice(self.client_id.as_bytes());
         request[56..64].copy_from_slice(
             &(self.downloaded as i64).to_be_bytes()
         );
@@ -412,16 +372,8 @@ impl Trackers {
             }
         }
 
-        let client_id = self.client_id
-            .iter() .map(|b| format!("%{b:02X}"))
-            .collect::<String>();
-
-        let info_hash = self.info_hash
-            .iter() .map(|b| format!("%{b:02X}"))
-            .collect::<String>();
-
         let res = reqwest::get(
-            format!("{url}&info_hash={}&peer_id={}", info_hash, client_id)
+            format!("{url}&info_hash={}&peer_id={}", self.info_hash.encode(), self.client_id.encode())
         ).await?;
         let body = res.bytes().await?;
         let response = TrackerResponse::from_bencode(&body)
@@ -445,23 +397,13 @@ impl Trackers {
         self.seeders = response.seeders.max(self.seeders);
         self.leechers = response.leechers.max(self.leechers);
 
-        let mut peers: HashSet<_> = self.peers.drain(..).collect();
-        peers.extend(response.peers);
-        self.peers = peers.into_iter().collect();
-    }
-}
-
-impl fmt::Display for PeerInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)?;
-        if let Some(id) = self.id {
-            write!(
-                f,
-                " ({:02x}{:02x}{:02x}{:02x}...{:02x}{:02x}{:02x}{:02x})",
-                id[0], id[1], id[2], id[3], id[16], id[17], id[18], id[19],
-            )?;
+        for peer in response.peers {
+            if let Some(m) = self.peers.iter_mut().find(|m| m.is_same_peer(&peer)) {
+                m.merge(peer);
+            } else {
+                self.peers.push(peer);
+            }
         }
-        Ok(())
     }
 }
 

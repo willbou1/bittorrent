@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::{
     bencode::BencodeValue,
     util::pretty_size,
+    types::*,
 };
 
 pub struct MetainfoFile {
@@ -28,7 +29,7 @@ pub struct Metainfo {
     pub piece_length: usize,
     pub pieces: Vec<[u8; 20]>,
     pub files: Vec<MetainfoFile>,
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 
     // derived from metainfo
     pub num_pieces: usize,
@@ -110,7 +111,7 @@ impl Metainfo {
         }
 
         Ok(Metainfo {
-            info_hash: Sha1::digest(info.to_bytes()).into(),
+            info_hash: InfoHash::from(Sha1::digest(info.to_bytes()).into()),
             announces: match root.get("announce-list") {
                 Some(announce_list) => announce_list
                     .as_list()
@@ -155,7 +156,7 @@ impl fmt::Display for Metainfo {
         writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{} ({})", "Pieces",
             self.pieces.len(), pretty_size(self.piece_length))?;
         writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Info hash",
-            self.info_hash.map(|b| format!("{b:02x}")).join(""))?;
+            self.info_hash)?;
         writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Length",
             pretty_size(self.length))?;
         write!(f, "{INDENT}{:<LABEL_WIDTH$}", "Tracker tiers")?;
