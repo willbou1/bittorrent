@@ -64,8 +64,8 @@ impl PeerId {
     pub fn to_compact(&self) -> String {
         let id = self.0;
         format!(
-            " ({:02x}{:02x}{:02x}{:02x}...{:02x}{:02x}{:02x}{:02x})",
-            id[0], id[1], id[2], id[3], id[16], id[17], id[18], id[19],
+            "{:02x}{:02x}{:02x}..{:02x}{:02x}{:02x}",
+            id[0], id[1], id[2], id[17], id[18], id[19],
         )
     }
 

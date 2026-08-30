@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BencodeValue {
     ByteString(Vec<u8>),
     Integer(i64),

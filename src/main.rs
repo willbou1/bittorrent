@@ -49,13 +49,15 @@ async fn main() {
             let token_clone = token.clone();
             let uri = args[2].clone();
 
-            if uri.starts_with("magnet:?") {
-                return;
-            }
 
             let task = tokio::spawn( async move {
-                let mut torrent = Torrent::from_torrent_file(&PathBuf::from(uri), &client_id).await.unwrap();
-                torrent.run(token_clone).await;
+                if uri.starts_with("magnet:?") {
+                    let mut torrent = Torrent::from_magnet(&uri, client_id).await.unwrap();
+                    torrent.run(token_clone).await;
+                } else {
+                    let mut torrent = Torrent::from_torrent_file(&PathBuf::from(uri), client_id).await.unwrap();
+                    torrent.run(token_clone).await;
+                }
             });
             let _ = signal::ctrl_c().await;
             token.cancel();

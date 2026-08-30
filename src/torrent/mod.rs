@@ -9,6 +9,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, debug, Instrument, Span};
+use transfer::Transfer;
 use url::Url;
 use std::{
     collections::HashMap,
@@ -17,38 +18,60 @@ use std::{
 };
 
 use crate::{
-    bitfield::PieceBitfield,
-    metainfo::{Metainfo, Metadata},
-    types::{InfoHash, PeerId},
-    peer::{Message, Peer},
-    tracker::{Progress, Trackers},
-    util::pretty_size,
-    types::*,
+    bencode::BencodeValue, bitfield::PieceBitfield, metainfo::{Metadata, Metainfo}, peer::{Message, Peer}, tracker::{Progress, Trackers}, types::{InfoHash, PeerId, *}
 };
-use piece::Piece;
-use download::Download;
+
+const BLOCK_SIZE: usize = 16 * 1024;
 
 pub enum Event {
     Message(PeerId, Message),
+
     Connection(Peer, PeerInfo),
     ConnectionFailure(PeerInfo, anyhow::Error),
     Disconnection(PeerId, anyhow::Error),
-    Discovery(Vec<PeerInfo>),
+
+    Tracker(Vec<PeerInfo>),
 }
 
 pub struct Connection {
     info: PeerInfo,
+    tx: mpsc::Sender<Message>,
+
+    connected: bool,
+
     client: Option<String>,
+    supports_pex: bool,
+    supports_metadataa: bool,
+}
+
+impl Connection {
+    fn new(info: PeerInfo, tx: mpsc::Sender<Message>) -> Self {
+        Self {
+            tx,
+            client: None,
+            info,
+            supports_metadataa: false,
+            supports_pex: false,
+            connected: true,
+        }
+    }
 }
 
 pub struct Torrent {
     metainfo: Metainfo,
+    display_name: String,
+
     connections: HashMap<PeerId, Connection>,
     rx: mpsc::Receiver<Event>,
     peer_tx: mpsc::Sender<Event>,
     tracker_tx: mpsc::Sender<Progress>,
     client_id: PeerId,
     span: Span,
+
+    transfer: Option<Transfer>,
+
+    metadata_bitfield: Option<PieceBitfield>,
+    metadata: Vec<u8>,
 }
 
 impl Torrent {
@@ -57,7 +80,7 @@ impl Torrent {
         let mut pairs = url.query_pairs();
         let xt = pairs.find(|(n, _)| n == "xt").unwrap();
         let dn = pairs.find(|(n, _)| n == "dn").unwrap();
-        let display_name = dn.1;
+        let display_name = dn.1.into_owned();
 
         let info_hash = InfoHash::from_xt(&xt.1).unwrap();
         let trackers: Vec<_> = pairs.filter(|(n, _)| n == "tr")
@@ -68,7 +91,6 @@ impl Torrent {
             name = %display_name,
         );
         let _enter = span.enter();
-        warn!("{info_hash}");
 
         let (tx, rx) = mpsc::channel(100);
 
@@ -90,6 +112,10 @@ impl Torrent {
             rx,
             span: span.clone(),
             client_id,
+            transfer: None,
+            display_name,
+            metadata_bitfield: None,
+            metadata: Vec::new(),
         })
     }
 
@@ -98,16 +124,16 @@ impl Torrent {
         client_id: PeerId,
     ) -> Result<Self> {
         let file = fs::read(path).await?;
-        let metainfo = Metainfo::from_bytes(&file)
+        let (metainfo, metadata) = Metainfo::from_bytes(&file)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         {}
         info!("Parsed metainfo:\n{}", metainfo);
+        info!("Parsed metadata:\n{}", metadata);
         let span = tracing::info_span!(
             "torrent",
-            name = %metainfo.name,
+            name = %metadata.name,
         );
         let _enter = span.enter();
-
 
         let (tx, rx) = mpsc::channel(100);
 
@@ -117,7 +143,7 @@ impl Torrent {
             tracker_rx,
             client_id,
             metainfo.info_hash,
-            metainfo.announces,
+            metainfo.announces.clone(),
         );
         tokio::spawn(trackers.run().instrument(span.clone()));
 
@@ -129,16 +155,15 @@ impl Torrent {
             rx,
             span: span.clone(),
             client_id,
+            display_name: metadata.name.clone(),
+            transfer: Some(Transfer::new(metadata).await?),
+            metadata_bitfield: None,
+            metadata: Vec::new(),
         })
     }
 
     pub async fn run(&mut self, token: CancellationToken) -> Result<()> {
-        let span = tracing::info_span!(
-            "torrent",
-            name = %self.metainfo.name,
-        );
-
-
+        let span = self.span.clone();
         async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -150,7 +175,9 @@ impl Torrent {
                         self.tick().await?;
                     }
                     _ = token.cancelled() => {
-                        self.save_state().await?;
+                        if let Some(transfer) = &self.transfer {
+                            transfer.save_state().await?;
+                        }
                         break;
                     }
                 }
@@ -160,55 +187,46 @@ impl Torrent {
     }
 
 
-    fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
+    fn statistics(&mut self) {
         let mut status = String::new();
         let mut downloaded_this_second = 0;
 
         for (peer_id, connection) in self.connections.iter_mut() {
             status.push_str(
-                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} \n",
+                &format!("    {} {} {} {}: {} \n",
+                    if connection.connected {"C"} else {"D"},
+                    if connection.supports_pex {"P"} else {"-"},
+                    if connection.supports_pex {"M"} else {"-"},
                     connection.info,
-                    if connection.choked {'C'} else {'U'},
-                    if connection.interested {'I'} else {'-'},
-                    connection.max_requests,
-                    connection.sent_requests,
-                    pretty_size(connection.downloaded_this_second),
-                    connection.response_times_sum.as_secs_f64() * 1000.
-                        / connection.num_response_times as f64,
-                    timeouts_this_second.get(peer_id).unwrap_or(&0),
-                    connection.chokes_this_second,
                     connection.client.as_ref().unwrap_or(&String::new())));
-
-            if (connection.last_download_rate as f64) > connection.downloaded_this_second as f64 * 1.3f64 {
-                // restrict pipeline
-                connection.max_requests = (connection.max_requests - MAX_REQUESTS_STEP)
-                    .max(MIN_MAX_REQUESTS);
-            }
-            else {
-                // open pipeline
-                connection.max_requests = (connection.max_requests + MAX_REQUESTS_STEP)
-                    .min(MAX_MAX_REQUESTS);
-            }
-
-            connection.last_download_rate = connection.downloaded_this_second;
-            downloaded_this_second += connection.downloaded_this_second;
-            connection.downloaded_this_second = 0;
-            connection.num_response_times = 0;
-            connection.response_times_sum = Duration::default();
-            connection.chokes_this_second = 0;
         }
 
-        info!("{:.2}% ({}/{}) ♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
-            self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
-            self.downloaded_pieces, self.pieces.len(),
+        info!("♟ {} \n{}",
             self.connections.len(),
-            pretty_size(downloaded_this_second),
-            timeouts_this_second.iter().fold(0, |acc, (k, v)| acc + v),
             status);
     }
 
     async fn tick(&mut self) -> Result<()> {
-        // tick download
+        if self.transfer.is_none() && let Some(bitfield) = &mut self.metadata_bitfield {
+            for (_, connection) in self.connections.iter_mut() {
+                if connection.supports_metadataa {
+                    for b in 0..bitfield.len() {
+                        connection.tx.send(Message::MetadataRequest {
+                            index: b
+                        }).await?;
+                    }
+                    break;
+                }
+            }
+        }
+        
+        if let Some(transfer) = &mut self.transfer {
+            transfer.tick().await?;
+        }
+
+        self.statistics();
+        
+        Ok(())
     }
 
     fn begin_connect(&self, info: &PeerInfo) {
@@ -238,34 +256,65 @@ impl Torrent {
                     );
                     let _enter = span.enter();
                     // dispatch to transfer layer
-                }
-            }
+                    match message {
+                        Message::MetadataRequest { .. } => (),
+                        Message::Metadata { index, piece, total_size } => {
+                            if let Some(bitfield) = &mut self.metadata_bitfield {
+                                self.metadata.resize(total_size, 0);
+                                bitfield.set_piece(index);
+                                let begin = index * BLOCK_SIZE;
+                                self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
+                                let mut complete = true;
+                                for b in 0..bitfield.len() {
+                                    complete &= bitfield.has_piece(b);
+                                }
+                                if complete {
+                                    let metadata = Metadata::from_bencode(
+                                        &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
+                                    ).unwrap();
+                                    warn!("{metadata}");
+                                }
+                            }
+                        },
+                        Message::MetadataReject { .. } => (),
+                        Message::KeepAlive => {}
 
-            Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
-                debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
-                connection.client = client;
-            }
+                        Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
+                            debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
+                            connection.client = client;
+                            connection.supports_metadataa |= extensions.contains_key("ut_metadata");
+                            connection.supports_pex |= extensions.contains_key("ut_pex");
+                            if let Some(metadata_size) = metadata_size && self.metadata_bitfield.is_none() {
+                                self.metadata_bitfield = Some(
+                                    PieceBitfield::new(metadata_size.div_ceil(BLOCK_SIZE))
+                                );
+                            }
+                        }
 
-            Message::Pex { added, dropped } => {
-                warn!("Got PEX {added:?} {dropped:?}");
-                for info in added {
-                    if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
-                        m.info.merge(info);
-                    } else {
-                        self.begin_connect(&info);
+                        Message::Pex { added, dropped } => {
+                            info!("Got PEX {added:?} {dropped:?}");
+                            for info in added {
+                                if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
+                                    m.info.merge(info);
+                                } else {
+                                    self.begin_connect(&info);
+                                }
+                            }
+                        }
+
+                        msg @ _ => {
+                            if let Some(transfer) = &mut self.transfer {
+                                transfer.handle_event(&peer_id, msg).await?;
+                            }
+                        }
                     }
                 }
             }
 
-            Message::MetadataRequest { .. } => (),
-            Message::Metadata { .. } => (),
-            Message::MetadataReject { .. } => (),
 
-            Message::KeepAlive => {}
 
             Event::Connection(peer, mut info) => {
                 let (tx, rx) = mpsc::channel(100);
-                tx.send(Message::Interested(true)).await?;
                 info.id = Some(peer.id);
                 debug!(peer = %info,"Connected with interest");
                 if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
@@ -273,9 +322,14 @@ impl Torrent {
                 } else {
                     self.connections.insert(
                         info.id.unwrap(),
-                        Connection::new(tx, self.metainfo.num_pieces, &info),
+                        Connection::new(info.clone(), tx.clone()),
                     );
-                    tokio::spawn(peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone()));
+                    tokio::spawn(
+                        peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone())
+                    );
+                    if let Some(transfer) = &mut self.transfer {
+                        transfer.add_connection(info.id.unwrap(), tx).await?;
+                    }
                 }
             }
 
@@ -284,11 +338,16 @@ impl Torrent {
             }
 
             Event::Disconnection(peer_id, e) => {
-                let connection = self.connections.remove(&peer_id).unwrap();
+                if let Some(transfer) = &mut self.transfer {
+                    transfer.sever_connection(&peer_id);
+                }
+                let connection = self.connections.get_mut(&peer_id).unwrap();
+                connection.connected = false;
                 info!(peer = %connection.info,"Disconnected {e}");
             }
 
-            Event::Discovery(peer_infos) => {
+
+            Event::Tracker(peer_infos) => {
                 info!("Discovered peers");
                 for info in peer_infos {
                     if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
@@ -299,6 +358,7 @@ impl Torrent {
                 }
             }
         }
-        self.dispatch_requests().await
+
+        Ok(())
     }
 }

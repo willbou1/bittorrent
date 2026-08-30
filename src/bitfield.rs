@@ -1,17 +1,24 @@
 #[derive(Debug)]
 pub struct PieceBitfield {
     buffer: Vec<u8>,
+    size: usize,
 }
 
 impl PieceBitfield {
     pub fn new(size: usize) -> Self {
         Self {
             buffer: vec![0; (size + 7) / 8],
+            size: size,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
     }
 
     pub fn from_vec(vec: Vec<u8>) -> Self {
         Self {
+            size: vec.len() * 8,
             buffer: vec,
         }
     }

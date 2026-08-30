@@ -7,6 +7,7 @@ use tokio::{
 use std::{
     path::{Path},
     collections::HashMap,
+    time::Duration,
 };
 use tracing::{info, warn, debug};
 
@@ -79,13 +80,13 @@ pub struct Transfer {
 
 impl Transfer {
     pub async fn new(metadata: Metadata) -> Result<Self> {
-        let (pieces, downloaded_pieces) = Self::load_state(&Metadata).await?;
-        Self {
+        let (pieces, downloaded_pieces) = Self::load_state(&metadata).await?;
+        Ok(Self {
             pieces,
             metadata,
             downloaded_pieces,
             connections: HashMap::new(),
-        }
+        })
     }
 
     async fn load_state(metadata: &Metadata) -> Result<(Vec<Piece>, usize)> {
@@ -135,21 +136,23 @@ impl Transfer {
         Ok(())
     }
 
-    fn add_connection(&mut self, peer_id: PeerId, tx: mpsc::Sender<Message>) {
+    pub async fn add_connection(&mut self, peer_id: PeerId, tx: mpsc::Sender<Message>) -> Result<()> {
+        tx.send(Message::Interested(true)).await?;
         self.connections.insert(
             peer_id,
             TransferConnection::new(tx, self.metadata.num_pieces),
         );
+        Ok(())
     }
 
-    fn sever_connection(&mut self, peer_id: &PeerId) {
+    pub fn sever_connection(&mut self, peer_id: &PeerId) {
         for piece in self.pieces.iter_mut() {
             piece.reset(&peer_id);
         }
         self.connections.remove(peer_id);
     }
     
-    async fn tick(&mut self) -> Result<()> {
+    pub async fn tick(&mut self) -> Result<()> {
         let mut timeouts_this_second = HashMap::new();
         for piece in self.pieces.iter_mut() {
             for (peer_id, count) in piece.check_timeout() {
@@ -167,18 +170,13 @@ impl Transfer {
         self.dispatch_requests().await
     }
 
-    pub async fn request_block(
+    async fn request_block(
         &mut self,
         peer_id: &PeerId,
         piece_index: usize,
         block_index: usize,
     ) -> Result<()> {
         let connection = self.connections.get(peer_id).unwrap();
-        let span = tracing::info_span!(
-            "connection",
-            info = %connection.info,
-        );
-        let _enter = span.enter();
 
         anyhow::ensure!(
             piece_index < self.metadata.num_pieces,
@@ -217,7 +215,7 @@ impl Transfer {
                 return Some(cursor);
         }
         
-        for (_, connection) in &self.torrent.connections {
+        for (_, connection) in &self.connections {
             if let Some(cursor) = connection.piece_cursor {
                 if self.pieces[cursor].is_available()
                     && target_connection.piece_bitfield.has_piece(cursor) {
@@ -257,6 +255,52 @@ impl Transfer {
         Ok(())
     }
 
+    fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
+        let mut status = String::new();
+        let mut downloaded_this_second = 0;
+
+        for (peer_id, connection) in self.connections.iter_mut() {
+            status.push_str(
+                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s \n",
+                    peer_id,
+                    if connection.choked {'C'} else {'U'},
+                    if connection.interested {'I'} else {'-'},
+                    connection.max_requests,
+                    connection.sent_requests,
+                    pretty_size(connection.downloaded_this_second),
+                    connection.response_times_sum.as_secs_f64() * 1000.
+                        / connection.num_response_times as f64,
+                    timeouts_this_second.get(peer_id).unwrap_or(&0),
+                    connection.chokes_this_second));
+
+            if (connection.last_download_rate as f64) > connection.downloaded_this_second as f64 * 1.3f64 {
+                // restrict pipeline
+                connection.max_requests = (connection.max_requests - MAX_REQUESTS_STEP)
+                    .max(MIN_MAX_REQUESTS);
+            }
+            else {
+                // open pipeline
+                connection.max_requests = (connection.max_requests + MAX_REQUESTS_STEP)
+                    .min(MAX_MAX_REQUESTS);
+            }
+
+            connection.last_download_rate = connection.downloaded_this_second;
+            downloaded_this_second += connection.downloaded_this_second;
+            connection.downloaded_this_second = 0;
+            connection.num_response_times = 0;
+            connection.response_times_sum = Duration::default();
+            connection.chokes_this_second = 0;
+        }
+
+        info!("{:.2}% ({}/{}) ♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
+            self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
+            self.downloaded_pieces, self.pieces.len(),
+            self.connections.len(),
+            pretty_size(downloaded_this_second),
+            timeouts_this_second.iter().fold(0, |acc, (k, v)| acc + v),
+            status);
+    }
+
     fn check_piece_index(&self, index: usize, op: &str) -> Result<()> {
         anyhow::ensure!(
             index < self.metadata.num_pieces,
@@ -266,7 +310,7 @@ impl Transfer {
         Ok(())
     }
 
-    fn check_piece_begin(&self, begin: usize, op: &str) -> Result<()> {
+    fn check_piece_begin(begin: usize, op: &str) -> Result<()> {
         anyhow::ensure!(
             begin % BLOCK_SIZE == 0,
             "Begin of {op} is not at block boundary, got {}",
@@ -275,7 +319,7 @@ impl Transfer {
         Ok(())
     }
 
-    async fn handle_event(
+    pub async fn handle_event(
         &mut self,
         peer_id: &PeerId,
         message: Message
@@ -293,14 +337,14 @@ impl Transfer {
                 }
 
                 Message::Have { index } => {
-                    self.check_piece_index(index, "have")?;
+                    //self.check_piece_index(index, "have")?;
                     connection.piece_bitfield.set_piece(index);
                     debug!("Handled have");
                 }
 
                 Message::Request { index, begin, length } => {
                     self.check_piece_index(index, "request")?;
-                    self.check_piece_begin(begin, "request")?;
+                    Self::check_piece_begin(begin, "request")?;
                     // TODO let's queue that later
                     debug!("Handled request");
                 }
@@ -311,8 +355,8 @@ impl Transfer {
                 }
 
                 Message::Piece { index, begin, piece: block, response_time } => {
-                    self.check_piece_index(index, "piece")?;
-                    self.check_piece_begin(begin, "piece")?;
+                    //self.check_piece_index(index, "piece")?;
+                    Self::check_piece_begin(begin, "piece")?;
                     let block_index = begin / BLOCK_SIZE;
                     debug!("Got block {index}:{block_index}");
                     connection.downloaded_this_second += block.len();
@@ -342,8 +386,8 @@ impl Transfer {
 
                 // extensions
                 Message::Reject { index, begin, length } => {
-                    self.check_piece_index(index, "reject")?;
-                    self.check_piece_begin(begin, "reject")?;
+                    //self.check_piece_index(index, "reject")?;
+                    Self::check_piece_begin(begin, "reject")?;
                     let block_index = begin / BLOCK_SIZE;
                     connection.sent_requests =
                         connection.sent_requests.saturating_sub(1);
@@ -353,9 +397,13 @@ impl Transfer {
                 Message::Unsupported { type_byte } => {
                     warn!("Handle unsupported message {type_byte}");
                 }
+
+                _ => (),
             }
 
-            self.dispatch_requests().await
+            self.dispatch_requests().await?;
         }
+
+        Ok(())
     }
 }

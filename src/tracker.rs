@@ -208,12 +208,12 @@ impl Trackers {
                         bad.push(url);
                     }
                 }
+                let _ = self.tx.send(torrent::Event::Tracker(self.peers.clone())).await;
             }
             good.extend(bad);
             self.urls[t] = good;
 
             if discovered {
-                let _ = self.tx.send(torrent::Event::Discovery(self.peers.clone())).await;
                 info!(tier = &t, "Successfully announced\n{self}");
                 if !ANNOUNCE_TO_ALL_TIERS {
                     return;

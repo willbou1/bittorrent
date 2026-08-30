@@ -146,14 +146,13 @@ impl fmt::Display for Metadata {
     }
 }
 
+#[derive(Clone)]
 pub struct Metainfo {
     pub announces: Vec<Vec<String>>,
 
     pub created_by: Option<String>,
     pub comment: Option<String>,
     pub info_hash: InfoHash,
-
-    pub metadata: Option<Metadata>,
 }
 
 impl Metainfo {
@@ -163,17 +162,16 @@ impl Metainfo {
             info_hash,
             created_by: None,
             comment: None,
-            metadata: None,
         }
     }
     
-    pub fn from_bytes(encoded: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(encoded: &[u8]) -> Result<(Self, Metadata), String> {
         let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
             || "Unable to find root dictionary"
         )?;
         let info = root.required("info")?;
 
-        Ok(Metainfo {
+        Ok((Metainfo {
             info_hash: InfoHash::from(Sha1::digest(info.to_bytes()).into()),
             announces: match root.get("announce-list") {
                 Some(announce_list) => announce_list
@@ -186,9 +184,7 @@ impl Metainfo {
             },
             created_by: root.optional_string("created by")?,
             comment: root.optional_string("comment")?,
-
-            metadata: Some(Metadata::from_bencode(&info)?),
-        })
+        }, Metadata::from_bencode(&info)?))
     }
 }
 
@@ -209,10 +205,6 @@ impl fmt::Display for Metainfo {
         }
         if let Some(comment) = &self.comment {
             writeln!(f, "{INDENT}{:<LABEL_WIDTH$}{}", "Comment", comment)?;
-        }
-
-        if let Some(metadata) = &self.metadata {
-            write!(f, "\n{metadata}")?;
         }
         Ok(())
     }
