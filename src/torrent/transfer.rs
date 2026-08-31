@@ -13,15 +13,13 @@ use tracing::{info, warn, debug};
 
 use crate::{
     bitfield::PieceBitfield,
-    metainfo::{Metainfo, Metadata},
-    peer::{Message, Peer},
+    metainfo::Metadata,
+    proto::bit_torrent::Message,
     util::pretty_size,
     types::*,
 };
 use super::{
     piece::Piece,
-    Torrent,
-    Connection,
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
@@ -240,7 +238,7 @@ impl Transfer {
                 match self.find_or_keep_piece(&self.connections[&peer_id]) {
                     Some(cursor) => {
                         self.connections.get_mut(&peer_id).unwrap().piece_cursor = Some(cursor);
-                        if let Some(b) = self.pieces[cursor].find_available_block() {
+                        if let Some(b) = self.pieces[cursor].find_available_block(&peer_id) {
                             self.pieces[cursor].download(b, peer_id);
                             self.request_block(&peer_id, cursor, b).await?;
                         }
@@ -391,8 +389,21 @@ impl Transfer {
                     let block_index = begin / BLOCK_SIZE;
                     connection.sent_requests =
                         connection.sent_requests.saturating_sub(1);
+                    self.pieces[index].reject(block_index, peer_id);
                     debug!("Got rejection for block {index}:{block_index}");
                 }
+                Message::HaveAll => {
+                    connection.piece_bitfield.fill(true);
+                    debug!("Got have all");
+                },
+                Message::HaveNone => {
+                    connection.piece_bitfield.fill(false);
+                    debug!("Got have none");
+                },
+                Message::Suggest { index } => {
+                    warn!("Got suggest for block {index}");
+                },
+                Message::AllowedFast { index } => (),
 
                 Message::Unsupported { type_byte } => {
                     warn!("Handle unsupported message {type_byte}");

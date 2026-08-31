@@ -1,7 +1,7 @@
 mod bencode;
 mod metainfo;
 mod tracker;
-mod peer;
+mod proto;
 mod bitfield;
 mod torrent;
 mod timer;
@@ -15,7 +15,7 @@ use std::{
 
 use torrent::Torrent;
 use bencode::BencodeValue;
-use types::{InfoHash, PeerId};
+use types::*;
 
 use tracing_subscriber::{EnvFilter, fmt};
 use tokio::{

@@ -43,6 +43,12 @@ impl PieceBitfield {
         self.buffer[index / 8] |= Self::bit(index);
     }
 
+    pub fn fill(&mut self, val: bool) {
+        for byte in self.buffer.iter_mut() {
+            *byte = if val {0xFF} else {0};
+        }
+    }
+
     pub fn unset_piece(&mut self, index: usize) {
         self.buffer[index / 8] &= !Self::bit(index);
     }

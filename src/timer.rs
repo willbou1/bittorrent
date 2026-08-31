@@ -34,4 +34,9 @@ impl Timer {
             None => self.elapsed,
         }
     }
+
+    pub fn restart(&mut self) {
+        self.elapsed = Duration::default();
+        self.start_time = self.start_time.map(|_| Instant::now());
+    }
 }

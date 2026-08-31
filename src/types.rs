@@ -145,7 +145,7 @@ impl fmt::Display for PeerEndpoint {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     pub id: Option<PeerId>,
     pub endpoints: HashSet<PeerEndpoint>,

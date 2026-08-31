@@ -22,6 +22,7 @@ type Hash = [u8; 20];
 
 const BLOCK_SIZE: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
+const REJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct File {
     pub path: PathBuf,
@@ -38,6 +39,7 @@ enum Block {
         peer_id: PeerId,
         timer: Timer,
     },
+    Rejected(HashMap<PeerId, Timer>),
     Downloaded(Vec<u8>),
     Written,
 }
@@ -97,7 +99,7 @@ impl Piece {
         self.written
     }
 
-    pub fn find_available_block(&mut self) -> Option<usize> {
+    pub fn find_available_block(&mut self, peer_id: &PeerId) -> Option<usize> {
         if !self.is_available() {
             return None;
         }
@@ -105,6 +107,17 @@ impl Piece {
         for (b, block) in self.blocks.iter_mut().enumerate() {
             match block {
                 Block::Unobtained => return Some(b),
+                Block::Rejected(timeouts) => {
+                    match timeouts.get(peer_id) {
+                        Some(timer) => {
+                            if timer.elapsed() > REJECTION_TIMEOUT {
+                                return Some(b);
+                            }
+                            continue;
+                        }
+                        None => return Some(b),
+                    }
+                },
                 _ => (),
             }
         }
@@ -112,7 +125,13 @@ impl Piece {
     }
 
     pub fn download(&mut self, index: usize, peer_id: PeerId) {
-        match self.blocks[index] {
+        match &mut self.blocks[index] {
+            Block::Rejected(timeouts) => {
+                match timeouts.get_mut(&peer_id) {
+                    Some(to) => to.restart(),
+                    None => (),
+                }
+            }
             Block::Unobtained => {
                 let mut timer = Timer::new();
                 timer.start();
@@ -126,9 +145,27 @@ impl Piece {
         }
     }
 
+    pub fn reject(&mut self, index: usize, peer_id: &PeerId) {
+        match &mut self.blocks[index] {
+            Block::Downloading { .. } => {
+                let mut timer = Timer::new();
+                timer.start();
+                self.blocks[index] = Block::Rejected(
+                    HashMap::from_iter([(peer_id.clone(), timer)])
+                );
+            }
+            Block::Rejected(timeouts)  => {
+                let mut timer = Timer::new();
+                timer.start();
+                timeouts.insert(peer_id.clone(), timer);
+            }
+            _ => (),
+        }
+    }
+
     pub async fn place(&mut self, index: usize, block: Vec<u8>) -> Result<bool> {
-        // TODO return a little weird 
         match self.blocks[index] {
+            Block::Rejected(_) |
             Block::Downloading { .. } => {
                 self.blocks[index] = Block::Downloaded(block);
                 self.downloading_blocks -= 1;

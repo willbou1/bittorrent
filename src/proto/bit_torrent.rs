@@ -51,11 +51,20 @@ pub enum Message {
     },
 
     // BEP 6: https://www.bittorrent.org/beps/bep_0006.html
+    // TODO : Choke no longer implicitly rejects all pending requests, thus eliminating some race conditions which could cause pieces to be needlessly requested multiple times.
     Reject {
         index: usize,
         begin: usize,
         length: usize,
     },
+    Suggest {
+        index: usize,
+    },
+    AllowedFast {
+        index: usize,
+    },
+    HaveAll,
+    HaveNone,
 
     // BEP 10: https://bittorrent.org/beps/bep_0010.html
     ExtensionHandshake {
@@ -233,13 +242,14 @@ type RequestKey = (usize, usize, usize);
 type RequestTimes = Arc<tokio::sync::Mutex<HashMap<RequestKey, Instant>>>;
 type ExtensionMapping = Arc<tokio::sync::Mutex<HashMap<String, u8>>>;
 
-pub struct Peer {
+pub struct BitTorrent {
     pub stream: TcpStream,
     pub name: String,
     pub id: PeerId,
+    pub supports_fast: bool,
 }
 
-impl Peer {
+impl BitTorrent {
     pub async fn handshake(
         peer_info: &PeerInfo,
         info_hash: &InfoHash,
@@ -258,10 +268,8 @@ impl Peer {
         // Send the handshake
         handshake[0] = 19;
         handshake[1..20].copy_from_slice(b"BitTorrent protocol");
-        handshake[20..28].copy_from_slice(
-            &0x00_00_00_00_00_10_00_00u64.to_be_bytes()
-        ); // Enable extension support
-        handshake[26..28].fill(0);
+        handshake[20 + 5] |= 0x10; // Enable extensions
+        handshake[20 + 7] |= 0x04; // Enable fast
         handshake[28..48].copy_from_slice(info_hash.as_bytes());
         handshake[48..68].copy_from_slice(local_id.as_bytes());
         stream.write_all(&handshake).await?;
@@ -293,6 +301,7 @@ impl Peer {
             stream,
             name,
             id: PeerId::from(handshake[48..68].try_into()?),
+            supports_fast: handshake[20 + 7] & 0x04 > 0,
         })
     }
 
@@ -301,10 +310,11 @@ impl Peer {
         tx: mpsc::Sender<Event>,
         mut rx: mpsc::Receiver<Message>,
     ) {
-        let Peer {
+        let BitTorrent {
             stream,
             name,
             id,
+            supports_fast,
         } = self;
         
         let request_times = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -382,25 +392,20 @@ impl Peer {
             payload.extend((begin as u32).to_be_bytes());
         }
 
+        trace!(peer = %name, "Sent {message:?}");
         match message {
             Message::Bitfield(bitfield) => {
                 payload.push(5);
                 payload.extend(bitfield.as_bytes());
-                log = format!("Sent bitfield {:?}", bitfield.as_bytes());
             }
             Message::Have { index } => {
                 payload.push(4);
                 payload.extend((index as u32).to_be_bytes());
-                log = format!("Sent have {index}");
             }
             Message::Request{ index, begin, length } => {
                 payload.push(6);
                 send_index_begin(&mut payload, index, begin);
                 payload.extend((length as u32).to_be_bytes());
-                log = format!(
-                    "Sent request {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
                 request_times.lock().await
                     .insert((index, begin, length), Instant::now());
             }
@@ -408,28 +413,18 @@ impl Peer {
                 payload.push(8);
                 send_index_begin(&mut payload, index, begin);
                 payload.extend((length as u32).to_be_bytes());
-                log = format!(
-                    "Sent cancel {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
             }
             Message::Piece{ index, begin, piece, .. } => {
                 payload.push(7);
                 send_index_begin(&mut payload, index, begin);
                 let piece_length = piece.len();
                 payload.extend(piece);
-                log = format!(
-                    "Sent piece {{index: {}, begin: {}, length: {}}}",
-                    index, begin, piece_length
-                );
             }
             Message::Choked(choked) => {
                 payload.push(if choked {0} else {1});
-                log = format!("Sent choke of {choked}");
             }
             Message::Interested(interested) => {
                 payload.push(if interested {2} else {3});
-                log = format!("Sent interest of {interested}");
             }
 
             // extensions
@@ -437,10 +432,20 @@ impl Peer {
                 payload.push(16);
                 send_index_begin(&mut payload, index, begin);
                 payload.extend((length as u32).to_be_bytes());
-                log = format!(
-                    "Sent reject {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
+            }
+            Message::HaveAll => {
+                payload.push(0x0E);
+            }
+            Message::HaveNone => {
+                payload.push(0x0F);
+            }
+            Message::Suggest { index } => {
+                payload.push(0x0D);
+                payload.extend((index as u32).to_be_bytes());
+            }
+            Message::AllowedFast { index } => {
+                payload.push(0x11);
+                payload.extend((index as u32).to_be_bytes());
             }
 
             Message::KeepAlive => {}
@@ -463,9 +468,18 @@ impl Peer {
         let length = u32::try_from(payload.len())?;
         writer.write_all(&length.to_be_bytes()).await?;
         writer.write_all(&payload).await?;
-        trace!(peer = %name, "{log}");
         Ok(())
     }
+
+    fn check_length(expected: usize, actual: usize, at_least: bool, op: &str) -> Result<()> {
+        anyhow::ensure!(
+            if at_least {actual >= expected} else {actual == expected},
+            "The length of a bitfield payloud should be{} {expected}, got {actual}",
+            if at_least {" at least "} else {""}
+        );
+        Ok(())
+    }
+
 
     async fn receive(
         reader: &mut OwnedReadHalf,
@@ -492,46 +506,28 @@ impl Peer {
 
         let mut id_buf = [0u8; 1];
         reader.read_exact(&mut id_buf).await?;
-        match id_buf[0] {
+        let msg = match id_buf[0] {
             5 => { // bitfield
-                anyhow::ensure!(
-                    message_length >= 2,
-                    "The length of a bitfield payloud should be at least 2, got {message_length}"
-                );
+                Self::check_length(2, message_length, true, "bitfield")?;
                 let mut bitfield = vec![0u8; message_length - 1];
                 reader.read_exact(&mut bitfield).await?;
-                trace!(peer = %name, "Received bitfield {:?}", bitfield);
                 Ok(Message::Bitfield(PieceBitfield::from_vec(bitfield)))
             }
             4 => { // have
-                anyhow::ensure!(
-                    message_length == 1 + 4,
-                    "The length of an have payloud should be 5, got {message_length}"
-                );
+                Self::check_length(1 + 4, message_length, false, "have")?;
                 reader.read_exact(&mut int_buf).await?;
                 let index = u32::from_be_bytes(int_buf) as usize;
-                trace!(peer = %name, "Received have {:?}", index);
                 Ok(Message::Have { index })
             }
             6 => { // request
-                anyhow::ensure!(
-                    message_length == 1 + 4 + 4 + 4,
-                    "The length of a request payloud should be 13, got {message_length}"
-                );
+                Self::check_length(1 + 4 * 3, message_length, false, "request")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                trace!(peer = %name,
-                    "Received request {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
                 Ok(Message::Request { index, begin, length })
             }
             7 => { // piece
-                anyhow::ensure!(
-                    message_length > 1 + 4 + 4,
-                    "The length of a piece payloud should be at least 10, got {message_length}"
-                );
+                Self::check_length(1 + 4 * 2, message_length, true, "piece")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 let mut piece = vec![0u8; message_length - 1 - 4 - 4];
                 reader.read_exact(&mut piece).await?;
@@ -541,73 +537,58 @@ impl Peer {
                     .remove(&key);
                 let response_time = sent_at.map(|t| t.elapsed());
 
-                trace!(peer = %name,
-                    "Received piece {{index: {}, begin: {}, length: {}}}",
-                    index, begin, piece.len()
-                );
                 Ok(Message::Piece { index, begin, piece, response_time })
             }
             8 => { // cancel
-                anyhow::ensure!(
-                    message_length == 1 + 4 + 4 + 4,
-                    "The length of a cancel payloud should be 13, got {message_length}"
-                );
+                Self::check_length(1 + 4 * 3, message_length, false, "cancel")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                trace!(peer = %name,
-                    "Received cancel {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
                 Ok(Message::Cancel { index, begin, length })
             }
             0 => {
-                anyhow::ensure!(
-                    message_length == 1,
-                    "The length of a choke payload should be 1, got {message_length}"
-                );
-                trace!(peer = %name, "Received choke");
+                Self::check_length(1, message_length, false, "choke")?;
                 Ok(Message::Choked(true))
             }
             1 => {
-                anyhow::ensure!(
-                    message_length == 1,
-                    "The length of an unchoke payload should be 1, got {message_length}"
-                );
-                trace!(peer = %name, "Received unchoke");
+                Self::check_length(1, message_length, false, "unchoke")?;
                 Ok(Message::Choked(false))
             }
             2 => {
-                anyhow::ensure!(
-                    message_length == 1,
-
-                    "The length of an intereseted payload should be 1, got {message_length}"
-                );
-                trace!(peer = %name, "Received interested");
+                Self::check_length(1, message_length, false, "interested")?;
                 Ok(Message::Interested(true))
             }
             3 => {
-                anyhow::ensure!(
-                    message_length == 1,
-                    "The length of an uninterested payload should be 1, got {message_length}"
-                );
-                trace!(peer = %name, "Received uninterested");
+                Self::check_length(1, message_length, false, "uninterested")?;
                 Ok(Message::Interested(false))
             }
 
             16 => { // reject
-                anyhow::ensure!(
-                    message_length == 1 + 4 + 4 + 4,
-                    "The length of a reject payloud should be 13, got {message_length}"
-                );
+                Self::check_length(1 + 4 * 3, message_length, false, "reject")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                trace!(peer = %name,
-                    "Received reject {{index: {}, begin: {}, length: {}}}",
-                    index, begin, length
-                );
                 Ok(Message::Reject { index, begin, length })
+            }
+            0x0E => { // HaveAll
+                Self::check_length(1, message_length, false, "have all")?;
+                Ok(Message::HaveAll)
+            }
+            0x0F => { // HaveNone
+                Self::check_length(1, message_length, false, "have none")?;
+                Ok(Message::HaveNone)
+            }
+            0x0D => { // suggest
+                Self::check_length(1 + 4, message_length, false, "suggest")?;
+                reader.read_exact(&mut int_buf).await?;
+                let index = u32::from_be_bytes(int_buf) as usize;
+                Ok(Message::Suggest { index })
+            }
+            0x11 => { // allow fast
+                Self::check_length(1 + 4, message_length, false, "allow fast")?;
+                reader.read_exact(&mut int_buf).await?;
+                let index = u32::from_be_bytes(int_buf) as usize;
+                Ok(Message::AllowedFast { index })
             }
 
             // extensions
@@ -638,9 +619,10 @@ impl Peer {
             _ => {
                 let mut payload = vec![0u8; message_length - 1];
                 reader.read_exact(&mut payload).await?;
-                trace!(peer = %name, "Unsopported message {}", id_buf[0]);
                 Ok(Message::Unsupported { type_byte: id_buf[0] })
             }
-        }
+        };
+        trace!(peer = %name, "Received {msg:?}");
+        msg
     }
 }
