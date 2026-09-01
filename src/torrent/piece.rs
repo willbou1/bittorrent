@@ -33,15 +33,38 @@ pub struct File {
 }
 
 #[derive(Clone)]
-enum Block {
+enum BlockState {
     Unobtained,
     Downloading {
         peer_id: PeerId,
         timer: Timer,
     },
-    Rejected(HashMap<PeerId, Timer>),
     Downloaded(Vec<u8>),
     Written,
+}
+
+#[derive(Clone)]
+struct Block {
+    state: BlockState,
+    rejects: HashMap<PeerId, Timer>,
+}
+
+impl Block {
+    fn new(state: BlockState) -> Self {
+        Self {
+            state,
+            rejects: HashMap::new(),
+        }
+    }
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self {
+            state: BlockState::Unobtained,
+            rejects: HashMap::new(),
+        }
+    }
 }
 
 pub struct Piece {
@@ -71,7 +94,7 @@ impl Piece {
             .collect();
 
         Self {
-            blocks: vec![Block::Unobtained; num_blocks],
+            blocks: vec![Block::default(); num_blocks],
             downloaded_blocks: 0,
             downloading_blocks: 0,
             written,
@@ -105,12 +128,12 @@ impl Piece {
         }
 
         for (b, block) in self.blocks.iter_mut().enumerate() {
-            match block {
-                Block::Unobtained => return Some(b),
-                Block::Rejected(timeouts) => {
-                    match timeouts.get(peer_id) {
+            match block.state {
+                BlockState::Unobtained => {
+                    match block.rejects.get(peer_id) {
                         Some(timer) => {
                             if timer.elapsed() > REJECTION_TIMEOUT {
+                                block.rejects.remove(&peer_id);
                                 return Some(b);
                             }
                             continue;
@@ -125,17 +148,11 @@ impl Piece {
     }
 
     pub fn download(&mut self, index: usize, peer_id: PeerId) {
-        match &mut self.blocks[index] {
-            Block::Rejected(timeouts) => {
-                match timeouts.get_mut(&peer_id) {
-                    Some(to) => to.restart(),
-                    None => (),
-                }
-            }
-            Block::Unobtained => {
+        match &mut self.blocks[index].state {
+            state @ BlockState::Unobtained => {
                 let mut timer = Timer::new();
                 timer.start();
-                self.blocks[index] = Block::Downloading {
+                *state = BlockState::Downloading {
                     peer_id,
                     timer,
                 };
@@ -145,29 +162,24 @@ impl Piece {
         }
     }
 
-    pub fn reject(&mut self, index: usize, peer_id: &PeerId) {
-        match &mut self.blocks[index] {
-            Block::Downloading { .. } => {
+    pub fn reject(&mut self, index: usize, peer_id: PeerId) {
+        let block = &mut self.blocks[index];
+        match &mut block.state {
+            state @ BlockState::Downloading { .. } => {
                 let mut timer = Timer::new();
                 timer.start();
-                self.blocks[index] = Block::Rejected(
-                    HashMap::from_iter([(peer_id.clone(), timer)])
-                );
-            }
-            Block::Rejected(timeouts)  => {
-                let mut timer = Timer::new();
-                timer.start();
-                timeouts.insert(peer_id.clone(), timer);
+                block.rejects.insert(peer_id, timer);
+                *state = BlockState::Unobtained;
+                self.downloading_blocks -= 1;
             }
             _ => (),
         }
     }
 
     pub async fn place(&mut self, index: usize, block: Vec<u8>) -> Result<bool> {
-        match self.blocks[index] {
-            Block::Rejected(_) |
-            Block::Downloading { .. } => {
-                self.blocks[index] = Block::Downloaded(block);
+        match &mut self.blocks[index].state {
+            state @ BlockState::Downloading { .. } => {
+                *state = BlockState::Downloaded(block);
                 self.downloading_blocks -= 1;
                 self.downloaded_blocks += 1;
             }
@@ -188,13 +200,13 @@ impl Piece {
 
         let mut ret: HashMap<PeerId, usize> = HashMap::new();
         for (b, block) in self.blocks.iter_mut().enumerate() {
-            match block {
-                Block::Downloading { timer, peer_id, .. } => {
+            match &block.state {
+                BlockState::Downloading { timer, peer_id, .. } => {
                     if timer.elapsed() > TIMEOUT {
                         self.downloading_blocks -= 1;
                         debug!("Block {}:{b} timed out", self.index);
                         *ret.entry(*peer_id).or_insert(0) += 1;
-                        *block = Block::Unobtained;
+                        block.state = BlockState::Unobtained;
                     }
                 }
                 _ => (),
@@ -209,10 +221,11 @@ impl Piece {
         }
        
         for block in self.blocks.iter_mut() {
-            match block {
-                Block::Downloading { peer_id, .. } => {
+            match &mut block.state {
+                BlockState::Downloading { peer_id, .. } => {
                     if affected_peer_id == peer_id {
-                        *block = Block::Unobtained;
+                        block.state = BlockState::Unobtained;
+                        self.downloading_blocks -= 1;
                     }
                 }
                 _ => (),
@@ -227,8 +240,8 @@ impl Piece {
         
         let mut piece = vec![0; self.length];
         for (b, block) in self.blocks.iter().enumerate() {
-            match block {
-                Block::Downloaded(block) => {
+            match &block.state {
+                BlockState::Downloaded(block) => {
                     let begin = BLOCK_SIZE * b;
                     piece[begin..begin + block.len()].copy_from_slice(&block);
                 }
@@ -253,7 +266,7 @@ impl Piece {
         if let Some(piece) = self.assemble() {
             let correct = self.verify(&piece);
             if !correct {
-                self.blocks.fill(Block::Unobtained);
+                self.blocks.fill(Block::default());
                 return Ok(false);
             }
             
@@ -273,7 +286,7 @@ impl Piece {
                 debug!(piece = %self.index, "Written to {}", &path.to_string_lossy());
             }
 
-            self.blocks.fill(Block::Written);
+            self.blocks.fill(Block::new(BlockState::Written));
             self.written = true;
             return Ok(true);
         }

@@ -154,11 +154,11 @@ pub struct PeerInfo {
 
 impl fmt::Display for PeerInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(endpoint) = self.endpoints.iter().next() {
+        for (e, endpoint) in self.endpoints.iter().enumerate() {
             write!(f, "{}", endpoint)?;
-        }
-        if let Some(id) = self.id {
-            write!(f, " ({})", id.to_compact())?;
+            if e < self.endpoints.len() - 1 {
+                write!(f, ", ")?;
+            }
         }
         Ok(())
     }

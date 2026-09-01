@@ -51,7 +51,6 @@ pub enum Message {
     },
 
     // BEP 6: https://www.bittorrent.org/beps/bep_0006.html
-    // TODO : Choke no longer implicitly rejects all pending requests, thus eliminating some race conditions which could cause pieces to be needlessly requested multiple times.
     Reject {
         index: usize,
         begin: usize,
@@ -247,6 +246,7 @@ pub struct BitTorrent {
     pub name: String,
     pub id: PeerId,
     pub supports_fast: bool,
+    pub supports_dht: bool,
 }
 
 impl BitTorrent {
@@ -302,6 +302,7 @@ impl BitTorrent {
             name,
             id: PeerId::from(handshake[48..68].try_into()?),
             supports_fast: handshake[20 + 7] & 0x04 > 0,
+            supports_dht: handshake[20 + 7] & 0x01 > 0,
         })
     }
 
@@ -314,7 +315,7 @@ impl BitTorrent {
             stream,
             name,
             id,
-            supports_fast,
+            ..
         } = self;
         
         let request_times = Arc::new(tokio::sync::Mutex::new(HashMap::new()));

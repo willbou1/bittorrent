@@ -214,7 +214,7 @@ impl Trackers {
             self.urls[t] = good;
 
             if discovered {
-                info!(tier = &t, "Successfully announced\n{self}");
+                debug!(tier = &t, "Successfully announced tier\n{self}");
                 if !ANNOUNCE_TO_ALL_TIERS {
                     return;
                 }

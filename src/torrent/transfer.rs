@@ -19,7 +19,7 @@ use crate::{
     types::*,
 };
 use super::{
-    piece::Piece,
+    Connection, piece::Piece
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
@@ -30,6 +30,7 @@ const MAX_MAX_REQUESTS: usize = 70;
 const MAX_REQUESTS_STEP: usize = 2;
 
 pub struct TransferConnection {
+    supports_fast: bool,
     choked: bool,
     interested: bool,
     piece_bitfield: PieceBitfield,
@@ -43,11 +44,13 @@ pub struct TransferConnection {
     response_times_sum: Duration,
     num_response_times: usize,
     chokes_this_second: usize,
+    rejects_this_second: usize,
 }
 
 impl TransferConnection {
-    fn new(tx: mpsc::Sender<Message>, num_pieces: usize) -> Self {
+    fn new(tx: mpsc::Sender<Message>, num_pieces: usize, supports_fast: bool) -> Self {
         Self {
+            supports_fast,
             sent_requests: 0,
             piece_cursor: None,
             choked: true,
@@ -61,6 +64,7 @@ impl TransferConnection {
             num_response_times: 0,
             response_times_sum: Duration::default(),
             chokes_this_second: 0,
+            rejects_this_second: 0,
         }
     }
 
@@ -134,11 +138,16 @@ impl Transfer {
         Ok(())
     }
 
-    pub async fn add_connection(&mut self, peer_id: PeerId, tx: mpsc::Sender<Message>) -> Result<()> {
+    pub async fn add_connection(
+        &mut self,
+        peer_id: PeerId,
+        tx: mpsc::Sender<Message>,
+        supports_fast: bool,
+    ) -> Result<()> {
         tx.send(Message::Interested(true)).await?;
         self.connections.insert(
             peer_id,
-            TransferConnection::new(tx, self.metadata.num_pieces),
+            TransferConnection::new(tx, self.metadata.num_pieces, supports_fast),
         );
         Ok(())
     }
@@ -241,6 +250,8 @@ impl Transfer {
                         if let Some(b) = self.pieces[cursor].find_available_block(&peer_id) {
                             self.pieces[cursor].download(b, peer_id);
                             self.request_block(&peer_id, cursor, b).await?;
+                        } else {
+                            break;
                         }
                     }
                     None => {
@@ -259,7 +270,7 @@ impl Transfer {
 
         for (peer_id, connection) in self.connections.iter_mut() {
             status.push_str(
-                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s \n",
+                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} r/s \n",
                     peer_id,
                     if connection.choked {'C'} else {'U'},
                     if connection.interested {'I'} else {'-'},
@@ -269,7 +280,8 @@ impl Transfer {
                     connection.response_times_sum.as_secs_f64() * 1000.
                         / connection.num_response_times as f64,
                     timeouts_this_second.get(peer_id).unwrap_or(&0),
-                    connection.chokes_this_second));
+                    connection.chokes_this_second,
+                    connection.rejects_this_second));
 
             if (connection.last_download_rate as f64) > connection.downloaded_this_second as f64 * 1.3f64 {
                 // restrict pipeline
@@ -288,6 +300,7 @@ impl Transfer {
             connection.num_response_times = 0;
             connection.response_times_sum = Duration::default();
             connection.chokes_this_second = 0;
+            connection.rejects_this_second = 0;
         }
 
         info!("{:.2}% ({}/{}) ♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
@@ -374,9 +387,13 @@ impl Transfer {
                     debug!("Set choke {choked}");
                     if choked {
                         connection.chokes_this_second += 1;
-                        connection.sent_requests = 0;
-                        for piece in self.pieces.iter_mut() {
-                            piece.reset(&peer_id);
+
+                        if !connection.supports_fast {
+                            // All pending requests are considered invalidated
+                            for piece in self.pieces.iter_mut() {
+                                piece.reset(&peer_id);
+                            }
+                            connection.sent_requests = 0;
                         }
                     }
                 }
@@ -387,9 +404,10 @@ impl Transfer {
                     //self.check_piece_index(index, "reject")?;
                     Self::check_piece_begin(begin, "reject")?;
                     let block_index = begin / BLOCK_SIZE;
+                    connection.rejects_this_second += 1;
                     connection.sent_requests =
                         connection.sent_requests.saturating_sub(1);
-                    self.pieces[index].reject(block_index, peer_id);
+                    self.pieces[index].reject(block_index, peer_id.clone());
                     debug!("Got rejection for block {index}:{block_index}");
                 }
                 Message::HaveAll => {
