@@ -20,6 +20,7 @@ use crate::{
     bitfield::PieceBitfield,
     metainfo::{Metadata, Metainfo},
     proto::bit_torrent::{Message, BitTorrent},
+    proto::metadata::MetadataMessage,
     tracker::{Progress, Trackers},
     types::*,
 };
@@ -241,31 +242,33 @@ impl Torrent {
         status.push_str("\n    Discovered\n");
         for (_, connection) in self.connections.iter_mut() {
             status.push_str(
-                &format!("        {} | {} | {} {} {} {} | {} ({})\n",
+                &format!("        {} | {} | {} {} {} {} | {}\n            {}\n",
                     if connection.connected {"C"} else {"D"},
                     connection.info.id.unwrap(),
                     if connection.supports_fast {"FAST"} else {"    "},
                     if connection.supports_pex {"PEX"} else {"   "},
                     if connection.supports_metadataa {"META"} else {"    "},
                     if connection.supports_dht {"DHT"} else {"   "},
-                    connection.info,
                     connection.client.as_ref().unwrap_or(&String::new()),
+                    connection.info,
                 ));
         }
 
-        info!("♟ {} \n{}",
+        info!("✓ {} ⋯ {} \n{}",
             self.connections.len(),
+            self.discovery_attemps.len(),
             status);
     }
 
     async fn tick(&mut self) -> Result<()> {
         if self.transfer.is_none() && let Some(bitfield) = &mut self.metadata_bitfield {
             for (_, connection) in self.connections.iter_mut() {
-                if connection.supports_metadataa {
+                if connection.supports_metadataa && connection.connected {
                     for b in 0..bitfield.len() {
-                        connection.tx.send(Message::MetadataRequest {
+                        warn!("Metadata {b}");
+                        connection.tx.send(Message::Metadata(MetadataMessage::Request {
                             index: b
-                        }).await?;
+                        })).await?;
                     }
                     break;
                 }
@@ -327,26 +330,43 @@ impl Torrent {
                     let _enter = span.enter();
                     // dispatch to transfer layer
                     match message {
-                        Message::MetadataRequest { .. } => (),
-                        Message::Metadata { index, piece, total_size } => {
-                            if let Some(bitfield) = &mut self.metadata_bitfield {
-                                self.metadata.resize(total_size, 0);
-                                bitfield.set_piece(index);
-                                let begin = index * BLOCK_SIZE;
-                                self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
-                                let mut complete = true;
-                                for b in 0..bitfield.len() {
-                                    complete &= bitfield.has_piece(b);
+                        Message::Metadata(msg) => match msg {
+                            MetadataMessage::Request { .. } => (),
+                            MetadataMessage::Data { index, piece, total_size } => {
+                                if self.transfer.is_none() {
+                                    if let Some(bitfield) = &mut self.metadata_bitfield {
+                                        self.metadata.resize(total_size, 0);
+                                        bitfield.set_piece(index);
+                                        let begin = index * BLOCK_SIZE;
+                                        self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
+                                        let mut complete = true;
+                                        for b in 0..bitfield.len() {
+                                            complete &= bitfield.has_piece(b);
+                                        }
+                                        if complete {
+                                            let metadata = Metadata::from_bencode(
+                                                &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
+                                            ).unwrap();
+                                            warn!("Got metadata:\n{metadata}");
+                                            self.transfer = Some(Transfer::new(metadata).await?);
+                                            for (peer_id, con) in self.connections.iter()
+                                                .filter(|(k, v)| v.connected) {
+                                                    if let Some(transfer) = &mut self.transfer {
+                                                        transfer.add_connection(
+                                                            peer_id.clone(), con.tx.clone(), con.supports_fast
+                                                        ).await?;
+                                                    }
+                                                }
+                                        }
+                                    }
                                 }
-                                if complete {
-                                    let metadata = Metadata::from_bencode(
-                                        &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
-                                    ).unwrap();
-                                    warn!("{metadata}");
-                                }
-                            }
+                            },
+                            MetadataMessage::Reject { .. } => {
+                                warn!("Metadata reject");
+                            },
+                            _ => (),
                         },
-                        Message::MetadataReject { .. } => (),
+
                         Message::KeepAlive => {}
 
                         Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
@@ -361,11 +381,15 @@ impl Torrent {
                             }
                         }
 
-                        Message::Pex { added, dropped } => {
+                        Message::PEX { added, dropped } => {
                             debug!("Got PEX {added:?} {dropped:?}");
                             for info in added {
                                 self.discover(&info, DiscoveryMechanism::PEX);
                             }
+                        }
+
+                        Message::DHTPort { port } => {
+                            debug!("DHT port {port}");
                         }
 
                         msg @ _ => {

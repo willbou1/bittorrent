@@ -20,6 +20,10 @@ use crate::{
     bencode::BencodeValue,
     types::*,
 };
+use super::{
+    metadata::{MetadataMessage},
+    pex::from_pex_bytes,
+};
 
 const PEX_ID: u8 = 1;
 const METADATA_ID: u8 = 2;
@@ -74,22 +78,16 @@ pub enum Message {
     },
 
     // BEP 11: https://www.bittorrent.org/beps/bep_0011.html#bep-40
-    Pex {
+    PEX {
         added: Vec<PeerInfo>,
         dropped: Vec<PeerEndpoint>,
     },
 
-    // BEP 9: https://www.bittorrent.org/beps/bep_0009.html 
-    MetadataRequest {
-        index: usize,
-    },
-    MetadataReject {
-        index: usize,
-    },
-    Metadata {
-        index: usize,
-        total_size: usize,
-        piece: Vec<u8>,
+    Metadata(MetadataMessage),
+
+    // BEP 5: https://bittorrent.org/beps/bep_0005.html
+    DHTPort {
+        port: u16,
     },
 
     Unsupported {
@@ -124,27 +122,6 @@ impl Message {
                 ));
                 BencodeValue::Dictionary(root).to_bytes()
             }
-            Self::MetadataRequest { index } => {
-                let mut root = HashMap::new();
-                root.insert("msg_type".to_string(), BencodeValue::Integer(0));
-                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
-                BencodeValue::Dictionary(root).to_bytes()
-            }
-            Self::Metadata { index, total_size, piece } => {
-                let mut root = HashMap::new();
-                root.insert("msg_type".to_string(), BencodeValue::Integer(0));
-                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
-                root.insert("total_size".to_string(), BencodeValue::Integer(total_size as i64));
-                let mut ret = BencodeValue::Dictionary(root).to_bytes();
-                ret.extend(piece);
-                ret
-            }
-            Self::MetadataReject { index } => {
-                let mut root = HashMap::new();
-                root.insert("msg_type".to_string(), BencodeValue::Integer(2));
-                root.insert("piece".to_string(), BencodeValue::Integer(index as i64));
-                BencodeValue::Dictionary(root).to_bytes()
-            }
             _ => Vec::new(),
         }
     }
@@ -162,77 +139,6 @@ impl Message {
             client: root.optional_string("v")?,
             max_requests: root.optional_unsigned("reqq")?.map(|m| m as usize),
             metadata_size: root.optional_unsigned("metadata_size")?.map(|s| s as usize),
-        })
-    }
-
-    pub fn from_pex_bytes(encoded: &[u8]) -> Result<Self, String> {
-        let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
-            || "Unable to find root dictionary"
-        )?;
-
-        let mut added = Vec::new();
-        let mut dropped = Vec::new();
-
-        let flags4 = root.optional_bytes("added.f")?;
-        let flags6 = root.optional_bytes("added6.f")?;
-
-        added.extend(
-            PeerEndpoint::from_compact_4(
-                &root.required_bytes("added")?
-            ).into_iter().enumerate().map(|(e, endpoint)| PeerInfo {
-                endpoints: HashSet::from_iter(vec![endpoint]),
-                id: None,
-                flags: flags4.as_ref().map(|f| f[e]),
-            })
-        );
-
-        added.extend(
-            PeerEndpoint::from_compact_6(
-                &root.required_bytes("added6")?
-            ).into_iter().enumerate().map(|(e, endpoint)| PeerInfo {
-                endpoints: HashSet::from_iter(vec![endpoint]),
-                id: None,
-                flags: flags6.as_ref().map(|f| f[e]),
-            })
-        );
-
-        dropped.extend(
-            PeerEndpoint::from_compact_4(
-                &root.required_bytes("dropped")?
-            )
-        );
-
-        dropped.extend(
-            PeerEndpoint::from_compact_6(
-                &root.required_bytes("dropped6")?
-            )
-        );
-
-        Ok(Self::Pex {
-            added,
-            dropped,
-        })
-    }
-
-    pub fn from_metadata_bytes(encoded: &[u8]) -> Result<Self, String> {
-        let decoded = BencodeValue::from_bytes(encoded)?;
-        let root = decoded.0.ok_or_else(
-            || "Unable to find root dictionary"
-        )?;
-
-        Ok(match root.required_unsigned("msg_type")? {
-            0 => Self::MetadataRequest {
-                index: root.required_unsigned("piece")? as usize,
-            },
-            1 => Self::Metadata {
-                index: root.required_unsigned("piece")? as usize,
-                total_size: root.required_unsigned("total_size")? as usize,
-                piece: decoded.1.to_vec(),
-            },
-            2 => Self::MetadataRequest {
-                index: root.required_unsigned("piece")? as usize,
-            },
-            _ => Self::Unsupported { type_byte: 20 + METADATA_ID },
         })
     }
 }
@@ -268,8 +174,9 @@ impl BitTorrent {
         // Send the handshake
         handshake[0] = 19;
         handshake[1..20].copy_from_slice(b"BitTorrent protocol");
-        handshake[20 + 5] |= 0x10; // Enable extensions
-        handshake[20 + 7] |= 0x04; // Enable fast
+        handshake[20 + 5] |= 0x10; // Advertise extensions
+        handshake[20 + 7] |= 0x04; // Advertise fast
+        handshake[20 + 7] |= 0x01; // Avertise DHT
         handshake[28..48].copy_from_slice(info_hash.as_bytes());
         handshake[48..68].copy_from_slice(local_id.as_bytes());
         stream.write_all(&handshake).await?;
@@ -385,7 +292,6 @@ impl BitTorrent {
         request_times: RequestTimes,
         extensions: ExtensionMapping,
     ) -> Result<()> {
-        let mut log = String::new();
         let mut payload = Vec::new();
 
         fn send_index_begin(payload: &mut Vec<u8>, index: usize, begin: usize) {
@@ -449,6 +355,11 @@ impl BitTorrent {
                 payload.extend((index as u32).to_be_bytes());
             }
 
+            Message::DHTPort { port } => {
+                payload.push(0x09);
+                payload.extend(port.to_be_bytes());
+            }
+
             Message::KeepAlive => {}
             Message::Unsupported { .. } => {}
             msg @ Message::ExtensionHandshake { .. } => {
@@ -456,14 +367,12 @@ impl BitTorrent {
                 payload.push(0);
                 payload.extend(msg.into_bytes());
             }
-            msg @ Message::MetadataRequest { .. } |
-            msg @ Message::MetadataReject { .. } |
-            msg @ Message::Metadata { .. } => {
+            Message::Metadata(msg) => {
                 payload.push(20);
                 payload.push(*extensions.lock().await.get("ut_metadata").unwrap());
                 payload.extend(msg.into_bytes());
             }
-            Message::Pex { .. } => {}
+            Message::PEX { .. } => {}
         }
 
         let length = u32::try_from(payload.len())?;
@@ -509,26 +418,26 @@ impl BitTorrent {
         reader.read_exact(&mut id_buf).await?;
         let msg = match id_buf[0] {
             5 => { // bitfield
-                Self::check_length(2, message_length, true, "bitfield")?;
+                Self::check_length(2, message_length, true, "Bitfield")?;
                 let mut bitfield = vec![0u8; message_length - 1];
                 reader.read_exact(&mut bitfield).await?;
-                Ok(Message::Bitfield(PieceBitfield::from_vec(bitfield)))
+                Message::Bitfield(PieceBitfield::from_vec(bitfield))
             }
             4 => { // have
-                Self::check_length(1 + 4, message_length, false, "have")?;
+                Self::check_length(1 + 4, message_length, false, "Have")?;
                 reader.read_exact(&mut int_buf).await?;
                 let index = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::Have { index })
+                Message::Have { index }
             }
             6 => { // request
-                Self::check_length(1 + 4 * 3, message_length, false, "request")?;
+                Self::check_length(1 + 4 * 3, message_length, false, "Request")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::Request { index, begin, length })
+                Message::Request { index, begin, length }
             }
             7 => { // piece
-                Self::check_length(1 + 4 * 2, message_length, true, "piece")?;
+                Self::check_length(1 + 4 * 2, message_length, true, "Piece")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 let mut piece = vec![0u8; message_length - 1 - 4 - 4];
                 reader.read_exact(&mut piece).await?;
@@ -538,58 +447,65 @@ impl BitTorrent {
                     .remove(&key);
                 let response_time = sent_at.map(|t| t.elapsed());
 
-                Ok(Message::Piece { index, begin, piece, response_time })
+                Message::Piece { index, begin, piece, response_time }
             }
             8 => { // cancel
-                Self::check_length(1 + 4 * 3, message_length, false, "cancel")?;
+                Self::check_length(1 + 4 * 3, message_length, false, "Cancel")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::Cancel { index, begin, length })
+                Message::Cancel { index, begin, length }
             }
             0 => {
-                Self::check_length(1, message_length, false, "choke")?;
-                Ok(Message::Choked(true))
+                Self::check_length(1, message_length, false, "Choke")?;
+                Message::Choked(true)
             }
             1 => {
-                Self::check_length(1, message_length, false, "unchoke")?;
-                Ok(Message::Choked(false))
+                Self::check_length(1, message_length, false, "Unchoke")?;
+                Message::Choked(false)
             }
             2 => {
-                Self::check_length(1, message_length, false, "interested")?;
-                Ok(Message::Interested(true))
+                Self::check_length(1, message_length, false, "Interested")?;
+                Message::Interested(true)
             }
             3 => {
-                Self::check_length(1, message_length, false, "uninterested")?;
-                Ok(Message::Interested(false))
+                Self::check_length(1, message_length, false, "Uninterested")?;
+                Message::Interested(false)
             }
 
             16 => { // reject
-                Self::check_length(1 + 4 * 3, message_length, false, "reject")?;
+                Self::check_length(1 + 4 * 3, message_length, false, "Reject")?;
                 let (index, begin) = receive_index_begin(reader).await?;
                 reader.read_exact(&mut int_buf).await?;
                 let length = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::Reject { index, begin, length })
+                Message::Reject { index, begin, length }
             }
             0x0E => { // HaveAll
-                Self::check_length(1, message_length, false, "have all")?;
-                Ok(Message::HaveAll)
+                Self::check_length(1, message_length, false, "HaveAll")?;
+                Message::HaveAll
             }
             0x0F => { // HaveNone
-                Self::check_length(1, message_length, false, "have none")?;
-                Ok(Message::HaveNone)
+                Self::check_length(1, message_length, false, "HaveNone")?;
+                Message::HaveNone
             }
             0x0D => { // suggest
                 Self::check_length(1 + 4, message_length, false, "suggest")?;
                 reader.read_exact(&mut int_buf).await?;
                 let index = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::Suggest { index })
+                Message::Suggest { index }
             }
             0x11 => { // allow fast
-                Self::check_length(1 + 4, message_length, false, "allow fast")?;
+                Self::check_length(1 + 4, message_length, false, "AllowFast")?;
                 reader.read_exact(&mut int_buf).await?;
                 let index = u32::from_be_bytes(int_buf) as usize;
-                Ok(Message::AllowedFast { index })
+                Message::AllowedFast { index }
+            }
+
+            0x09 => { // DHTPort
+                Self::check_length(1 + 2, message_length, false, "DHTPort")?;
+                reader.read_exact(&mut int_buf).await?;
+                let port = u16::from_be_bytes(int_buf[0..2].try_into().unwrap());
+                Message::DHTPort { port }
             }
 
             // extensions
@@ -607,23 +523,25 @@ impl BitTorrent {
                         if let Message::ExtensionHandshake { extensions: new, .. } = &msg {
                             extensions.lock().await.extend(new.clone());
                         }
-                        Ok(msg)
+                        msg
                     }
-                    PEX_ID => Message::from_pex_bytes(&payload[1..])
-                        .map_err(|e| anyhow::anyhow!("{e}")),
-                    METADATA_ID => Message::from_metadata_bytes(&payload[1..])
-                        .map_err(|e| anyhow::anyhow!("{e}")),
-                    _ => Ok(Message::Unsupported { type_byte: payload[0] + 20 }),
+                    PEX_ID => from_pex_bytes(&payload[1..])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    METADATA_ID => Message::Metadata(
+                        MetadataMessage::from_bytes(&payload[1..])
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                    ),
+                    _ => Message::Unsupported { type_byte: payload[0] + 20 },
                 }
             }
 
             _ => {
                 let mut payload = vec![0u8; message_length - 1];
                 reader.read_exact(&mut payload).await?;
-                Ok(Message::Unsupported { type_byte: id_buf[0] })
+                Message::Unsupported { type_byte: id_buf[0] }
             }
         };
         trace!(peer = %name, "Received {msg:?}");
-        msg
+        Ok(msg)
     }
 }
