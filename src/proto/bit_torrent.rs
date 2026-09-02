@@ -22,7 +22,7 @@ use crate::{
 };
 use super::{
     metadata::{MetadataMessage},
-    pex::from_pex_bytes,
+    pex::PEXMessage,
 };
 
 const PEX_ID: u8 = 1;
@@ -30,7 +30,9 @@ const METADATA_ID: u8 = 2;
 
 #[derive(Debug)]
 pub enum Message {
+    // TODO send keep alive periodically
     KeepAlive,
+
     Choked(bool),
     Interested(bool),
     Bitfield(PieceBitfield),
@@ -76,13 +78,7 @@ pub enum Message {
         max_requests: Option<usize>,
         metadata_size: Option<usize>,
     },
-
-    // BEP 11: https://www.bittorrent.org/beps/bep_0011.html#bep-40
-    PEX {
-        added: Vec<PeerInfo>,
-        dropped: Vec<PeerEndpoint>,
-    },
-
+    PEX(PEXMessage),
     Metadata(MetadataMessage),
 
     // BEP 5: https://bittorrent.org/beps/bep_0005.html
@@ -90,6 +86,9 @@ pub enum Message {
         port: u16,
     },
 
+    UnsupportedExtension {
+        type_byte: u8,
+    },
     Unsupported {
         type_byte: u8,
     },
@@ -362,6 +361,7 @@ impl BitTorrent {
 
             Message::KeepAlive => {}
             Message::Unsupported { .. } => {}
+            Message::UnsupportedExtension { .. } => {}
             msg @ Message::ExtensionHandshake { .. } => {
                 payload.push(20);
                 payload.push(0);
@@ -384,7 +384,7 @@ impl BitTorrent {
     fn check_length(expected: usize, actual: usize, at_least: bool, op: &str) -> Result<()> {
         anyhow::ensure!(
             if at_least {actual >= expected} else {actual == expected},
-            "The length of a bitfield payloud should be{} {expected}, got {actual}",
+            "The length of a {op} payloud should be{} {expected}, got {actual}",
             if at_least {" at least "} else {""}
         );
         Ok(())
@@ -503,7 +503,7 @@ impl BitTorrent {
 
             0x09 => { // DHTPort
                 Self::check_length(1 + 2, message_length, false, "DHTPort")?;
-                reader.read_exact(&mut int_buf).await?;
+                reader.read_exact(&mut int_buf[0..2]).await?;
                 let port = u16::from_be_bytes(int_buf[0..2].try_into().unwrap());
                 Message::DHTPort { port }
             }
@@ -525,13 +525,19 @@ impl BitTorrent {
                         }
                         msg
                     }
-                    PEX_ID => from_pex_bytes(&payload[1..])
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    PEX_ID => Message::PEX(
+                        PEXMessage::from_bytes(&payload[1..])
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                    ),
                     METADATA_ID => Message::Metadata(
                         MetadataMessage::from_bytes(&payload[1..])
                             .map_err(|e| anyhow::anyhow!("{e}"))?
                     ),
-                    _ => Message::Unsupported { type_byte: payload[0] + 20 },
+                    _ => {
+                        let mut payload = vec![0u8; message_length - 1];
+                        reader.read_exact(&mut payload).await?;
+                        Message::UnsupportedExtension { type_byte: payload[0] }
+                    }
                 }
             }
 

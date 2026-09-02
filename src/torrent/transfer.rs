@@ -8,12 +8,13 @@ use std::{
     path::{Path},
     collections::HashMap,
     time::Duration,
+    io::SeekFrom,
 };
 use tracing::{info, warn, debug};
 
 use crate::{
     bitfield::PieceBitfield,
-    metainfo::Metadata,
+    metainfo::{Metadata, PieceFile},
     proto::bit_torrent::Message,
     util::pretty_size,
     types::*,
@@ -110,11 +111,11 @@ impl Transfer {
                 if written {
                     downloaded_pieces += 1;
                 }
-                pieces.push(Piece::new(metadata, p, written));
+                pieces.push(Piece::new(false, p, metadata.piece_length(p), metadata.pieces[p], written));
             }
         } else {
             for p in 0..metadata.num_pieces {
-                pieces.push(Piece::new(metadata, p, false));
+                pieces.push(Piece::new(false, p, metadata.piece_length(p), metadata.pieces[p], false));
             }
         }
         Ok((pieces, downloaded_pieces))
@@ -175,6 +176,26 @@ impl Transfer {
         self.statistics(&timeouts_this_second);
         
         self.dispatch_requests().await
+    }
+
+    async fn write_piece(&self, index: usize, piece: &[u8]) -> Result<()> {
+        for piece_file in &self.metadata.piece_files[index] {
+            let file = &self.metadata.files[piece_file.file_index];
+            let path = Path::new("torrents").join(file.path.clone());
+            fs::create_dir_all(&path.parent().unwrap()).await?;
+            let mut dst_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path).await?;
+            dst_file.set_len(file.length as u64).await?;
+            dst_file.seek(SeekFrom::Start(piece_file.file_offset as u64)).await?;
+            dst_file.write_all(
+                &piece[piece_file.piece_offset..(piece_file.piece_offset + piece_file.length)],
+            ).await?;
+            debug!(piece = %index, "Written to {}", &path.to_string_lossy());
+        }
+        Ok(())
     }
 
     async fn request_block(
@@ -321,11 +342,29 @@ impl Transfer {
         Ok(())
     }
 
-    fn check_piece_begin(begin: usize, op: &str) -> Result<()> {
+    fn check_piece_begin(&self, index: usize, begin: usize, op: &str) -> Result<()> {
+        self.check_piece_index(index, op)?;
         anyhow::ensure!(
             begin % BLOCK_SIZE == 0,
             "Begin of {op} is not at block boundary, got {}",
             begin
+        );
+        let piece_length = self.metadata.piece_length(index);
+        anyhow::ensure!(
+            begin < piece_length,
+            "Begin of {op} is past piece {index} of length {piece_length}, got {}",
+            begin
+        );
+        Ok(())
+    }
+
+    fn check_piece_length(&self, index: usize, begin: usize, length: usize, op: &str) -> Result<()> {
+        self.check_piece_begin(index, begin, op)?;
+        let piece_length = self.metadata.piece_length(index);
+        anyhow::ensure!(
+            begin + length <= piece_length,
+            "Length of {op} is past piece {index} of length {piece_length}, got {} + {}",
+            begin, length
         );
         Ok(())
     }
@@ -335,103 +374,120 @@ impl Transfer {
         peer_id: &PeerId,
         message: Message
     ) -> Result<()> {
-        if let Some(connection) = self.connections.get_mut(peer_id) {
-            match message {
-                Message::Bitfield(bitfield) => {
+        match message {
+            Message::Bitfield(bitfield) => {
+                if let Some(con) = self.connections.get_mut(peer_id) {
                     anyhow::ensure!(
-                        bitfield.num_bytes() == connection.piece_bitfield.num_bytes(),
+                        bitfield.num_bytes() == con.piece_bitfield.num_bytes(),
                         "The received bitfield should be {} bytes long, got {}",
-                        connection.piece_bitfield.num_bytes(), bitfield.num_bytes()
+                        con.piece_bitfield.num_bytes(), bitfield.num_bytes()
                     );
-                    connection.piece_bitfield.set_bytes(bitfield.as_bytes());
-                    debug!("Set bitfield {:?}", bitfield.as_bytes());
+                    con.piece_bitfield.set_bytes(bitfield.as_bytes());
                 }
+                debug!("Set bitfield {:?}", bitfield.as_bytes());
+            }
 
-                Message::Have { index } => {
-                    //self.check_piece_index(index, "have")?;
-                    connection.piece_bitfield.set_piece(index);
-                    debug!("Handled have");
+            Message::Have { index } => {
+                self.check_piece_index(index, "have")?;
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.piece_bitfield.set_piece(index);
                 }
+                debug!("Handled have");
+            }
 
-                Message::Request { index, begin, length } => {
-                    self.check_piece_index(index, "request")?;
-                    Self::check_piece_begin(begin, "request")?;
-                    // TODO let's queue that later
-                    debug!("Handled request");
-                }
+            Message::Request { index, begin, length } => {
+                self.check_piece_length(index, begin, length, "request")?;
+                // TODO let's queue that later
+                debug!("Handled request");
+            }
 
-                Message::Cancel { index, begin, length } => {
-                    self.check_piece_index(index, "cancel")?;
-                    debug!("Handled cancel");
-                }
+            Message::Cancel { index, begin, length } => {
+                self.check_piece_length(index, begin, length, "cancel")?;
+                debug!("Handled cancel");
+            }
 
-                Message::Piece { index, begin, piece: block, response_time } => {
-                    //self.check_piece_index(index, "piece")?;
-                    Self::check_piece_begin(begin, "piece")?;
-                    let block_index = begin / BLOCK_SIZE;
-                    debug!("Got block {index}:{block_index}");
-                    connection.downloaded_this_second += block.len();
+            Message::Piece { index, begin, piece: block, response_time } => {
+                self.check_piece_begin(index, begin, "piece")?;
+                let block_index = begin / BLOCK_SIZE;
+
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.downloaded_this_second += block.len();
                     if let Some(response_time) = response_time {
-                        connection.response_times_sum += response_time;
-                        connection.num_response_times += 1;
+                        con.response_times_sum += response_time;
+                        con.num_response_times += 1;
                     }
-                    if self.pieces[index].place(block_index, block).await? {
-                        self.downloaded_pieces += 1;
-                    }
-
-                    connection.sent_requests = connection.sent_requests.saturating_sub(1);
+                    con.sent_requests = con.sent_requests.saturating_sub(1);
                 }
 
-                Message::Choked(choked) => {
-                    connection.choked = choked;
-                    debug!("Set choke {choked}");
-                    if choked {
-                        connection.chokes_this_second += 1;
+                if let Some(piece) = self.pieces[index].place(block_index, block) {
+                    self.write_piece(index, &piece).await?;
+                    self.downloaded_pieces += 1;
+                }
 
-                        if !connection.supports_fast {
+                debug!("Got block {index}:{block_index}");
+            }
+
+            Message::Choked(choked) => {
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.choked = choked;
+                    if choked {
+                        con.chokes_this_second += 1;
+
+                        if !con.supports_fast {
                             // All pending requests are considered invalidated
                             for piece in self.pieces.iter_mut() {
                                 piece.reset(&peer_id);
                             }
-                            connection.sent_requests = 0;
+                            con.sent_requests = 0;
                         }
                     }
                 }
-                Message::Interested(interested) => connection.interested = interested,
-
-                // extensions
-                Message::Reject { index, begin, length } => {
-                    //self.check_piece_index(index, "reject")?;
-                    Self::check_piece_begin(begin, "reject")?;
-                    let block_index = begin / BLOCK_SIZE;
-                    connection.rejects_this_second += 1;
-                    connection.sent_requests =
-                        connection.sent_requests.saturating_sub(1);
-                    self.pieces[index].reject(block_index, peer_id.clone());
-                    debug!("Got rejection for block {index}:{block_index}");
+                debug!("Set choke {choked}");
+            }
+            Message::Interested(interested) => {
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.interested = interested;
                 }
-                Message::HaveAll => {
-                    connection.piece_bitfield.fill(true);
-                    debug!("Got have all");
-                },
-                Message::HaveNone => {
-                    connection.piece_bitfield.fill(false);
-                    debug!("Got have none");
-                },
-                Message::Suggest { index } => {
-                    warn!("Got suggest for block {index}");
-                },
-                Message::AllowedFast { index } => (),
-
-                Message::Unsupported { type_byte } => {
-                    warn!("Handle unsupported message {type_byte}");
-                }
-
-                _ => (),
             }
 
-            self.dispatch_requests().await?;
+            // extensions
+            Message::Reject { index, begin, length } => {
+                self.check_piece_length(index, begin, length, "reject")?;
+                let block_index = begin / BLOCK_SIZE;
+
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.rejects_this_second += 1;
+                    con.sent_requests = con.sent_requests.saturating_sub(1);
+                }
+
+                self.pieces[index].reject(block_index, peer_id.clone());
+                debug!("Got rejection for block {index}:{block_index}");
+            }
+            Message::HaveAll => {
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.piece_bitfield.fill(true);
+                }
+                debug!("Got have all");
+            },
+            Message::HaveNone => {
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.piece_bitfield.fill(false);
+                }
+                debug!("Got have none");
+            },
+            Message::Suggest { index } => {
+                warn!("Got suggest for block {index}");
+            },
+            Message::AllowedFast { index } => (),
+
+            Message::Unsupported { type_byte } => {
+                warn!("Handle unsupported message {type_byte}");
+            }
+
+            _ => (),
         }
+
+        self.dispatch_requests().await?;
 
         Ok(())
     }

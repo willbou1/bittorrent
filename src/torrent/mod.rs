@@ -4,7 +4,6 @@ mod transfer;
 use anyhow::Result;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
@@ -12,7 +11,7 @@ use tracing::{info, warn, debug, Instrument, Span};
 use transfer::Transfer;
 use url::Url;
 use std::{
-    collections::HashMap, ffi::FromVecWithNulError, path::{Path, PathBuf}, time::Duration
+    collections::HashMap, path::{Path, PathBuf}, time::Duration
 };
 
 use crate::{
@@ -21,6 +20,7 @@ use crate::{
     metainfo::{Metadata, Metainfo},
     proto::bit_torrent::{Message, BitTorrent},
     proto::metadata::MetadataMessage,
+    proto::pex::PEXMessage,
     tracker::{Progress, Trackers},
     types::*,
 };
@@ -204,7 +204,9 @@ impl Torrent {
             loop {
                 tokio::select! {
                     event = self.rx.recv() => {
-                        self.handle_event(event.unwrap()).await?;
+                        if let Err(e) = self.handle_event(event.unwrap()).await {
+                            warn!("Event handling error for: {e}");
+                        }
                     }
                     _ = interval.tick() => {
                         self.tick().await?;
@@ -275,11 +277,12 @@ impl Torrent {
             }
         }
         
+        self.statistics();
+
         if let Some(transfer) = &mut self.transfer {
             transfer.tick().await?;
         }
 
-        self.statistics();
         Ok(())
     }
 
@@ -318,6 +321,46 @@ impl Torrent {
             }
         }
     }
+
+    async fn handle_metadata_message(&mut self, message: MetadataMessage) -> Result<()> {
+        match message {
+            MetadataMessage::Request { .. } => (),
+            MetadataMessage::Data { index, piece, total_size } => {
+                if self.transfer.is_none() {
+                    if let Some(bitfield) = &mut self.metadata_bitfield {
+                        self.metadata.resize(total_size, 0);
+                        bitfield.set_piece(index);
+                        let begin = index * BLOCK_SIZE;
+                        self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
+                        let mut complete = true;
+                        for b in 0..bitfield.len() {
+                            complete &= bitfield.has_piece(b);
+                        }
+                        if complete {
+                            let metadata = Metadata::from_bencode(
+                                &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
+                            ).unwrap();
+                            warn!("Got metadata:\n{metadata}");
+                            self.transfer = Some(Transfer::new(metadata).await?);
+                            for (peer_id, con) in self.connections.iter()
+                                .filter(|(k, v)| v.connected) {
+                                    if let Some(transfer) = &mut self.transfer {
+                                        transfer.add_connection(
+                                            peer_id.clone(), con.tx.clone(), con.supports_fast
+                                        ).await?;
+                                    }
+                                }
+                        }
+                    }
+                }
+            },
+            MetadataMessage::Reject { .. } => {
+                warn!("Metadata reject");
+            },
+            _ => (),
+        }
+        Ok(())
+    }
     
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
@@ -330,42 +373,7 @@ impl Torrent {
                     let _enter = span.enter();
                     // dispatch to transfer layer
                     match message {
-                        Message::Metadata(msg) => match msg {
-                            MetadataMessage::Request { .. } => (),
-                            MetadataMessage::Data { index, piece, total_size } => {
-                                if self.transfer.is_none() {
-                                    if let Some(bitfield) = &mut self.metadata_bitfield {
-                                        self.metadata.resize(total_size, 0);
-                                        bitfield.set_piece(index);
-                                        let begin = index * BLOCK_SIZE;
-                                        self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
-                                        let mut complete = true;
-                                        for b in 0..bitfield.len() {
-                                            complete &= bitfield.has_piece(b);
-                                        }
-                                        if complete {
-                                            let metadata = Metadata::from_bencode(
-                                                &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
-                                            ).unwrap();
-                                            warn!("Got metadata:\n{metadata}");
-                                            self.transfer = Some(Transfer::new(metadata).await?);
-                                            for (peer_id, con) in self.connections.iter()
-                                                .filter(|(k, v)| v.connected) {
-                                                    if let Some(transfer) = &mut self.transfer {
-                                                        transfer.add_connection(
-                                                            peer_id.clone(), con.tx.clone(), con.supports_fast
-                                                        ).await?;
-                                                    }
-                                                }
-                                        }
-                                    }
-                                }
-                            },
-                            MetadataMessage::Reject { .. } => {
-                                warn!("Metadata reject");
-                            },
-                            _ => (),
-                        },
+                        Message::Metadata(msg) => self.handle_metadata_message(msg).await?,
 
                         Message::KeepAlive => {}
 
@@ -381,7 +389,7 @@ impl Torrent {
                             }
                         }
 
-                        Message::PEX { added, dropped } => {
+                        Message::PEX(PEXMessage { added, dropped }) => {
                             debug!("Got PEX {added:?} {dropped:?}");
                             for info in added {
                                 self.discover(&info, DiscoveryMechanism::PEX);
@@ -400,8 +408,6 @@ impl Torrent {
                     }
                 }
             }
-
-
 
             Event::Connection(peer, mut info) => {
                 self.discovery_attemps.retain(|a| a.info != info);
@@ -435,7 +441,18 @@ impl Torrent {
                 }
                 let connection = self.connections.get_mut(&peer_id).unwrap();
                 connection.connected = false;
-                debug!(peer = %connection.info,"Disconnected {e}");
+
+                // TODO keep an eye on this
+                let boring = e .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| matches!(e.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                    ));
+
+                if !boring {
+                    warn!(peer = %connection.info,"Disconnected {e}");
+                }
             }
 
 

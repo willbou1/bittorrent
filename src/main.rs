@@ -53,10 +53,10 @@ async fn main() {
             let task = tokio::spawn( async move {
                 if uri.starts_with("magnet:?") {
                     let mut torrent = Torrent::from_magnet(&uri, client_id).await.unwrap();
-                    torrent.run(token_clone).await;
+                    torrent.run(token_clone).await.unwrap();
                 } else {
                     let mut torrent = Torrent::from_torrent_file(&PathBuf::from(uri), client_id).await.unwrap();
-                    torrent.run(token_clone).await;
+                    torrent.run(token_clone).await.unwrap();
                 }
             });
             let _ = signal::ctrl_c().await;

@@ -2,18 +2,11 @@ use anyhow::Result;
 use sha1::{Sha1, Digest};
 use std::{
     collections::{HashMap},
-    io::SeekFrom,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use tokio::{
-    fs,
-    io::{AsyncSeekExt, AsyncWriteExt},
+    time::{Duration},
 };
 use tracing::{info, warn, debug, trace};
 
 use crate::{
-    metainfo::{Metadata, PieceFile},
     timer::Timer,
     types::*,
 };
@@ -23,14 +16,6 @@ type Hash = [u8; 20];
 const BLOCK_SIZE: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
 const REJECTION_TIMEOUT: Duration = Duration::from_secs(10);
-
-pub struct File {
-    pub path: PathBuf,
-    pub piece_offset: usize,
-    pub file_offset: usize,
-    pub length: usize,
-    pub file_length: usize,
-}
 
 #[derive(Clone)]
 enum BlockState {
@@ -72,36 +57,31 @@ pub struct Piece {
     downloaded_blocks: usize,
     downloading_blocks: usize,
     written: bool,
-    index: usize,
     hash: Hash,
     length: usize,
-    files: Vec<File>,
+    index: usize,
+    for_metadata: bool,
 }
 
 impl Piece {
-    pub fn new(metadata: &Metadata, index: usize, written: bool) -> Self {
-        let length = metadata.piece_length(index);
+    pub fn new(
+        for_metadata: bool,
+        index: usize,
+        length: usize,
+        hash: Hash,
+        written: bool,
+    ) -> Self {
         let num_blocks = length.div_ceil(BLOCK_SIZE);
-        let files = metadata.piece_files[index]
-            .iter()
-            .map(|pf| File {
-                length: pf.length,
-                file_offset: pf.file_offset,
-                piece_offset: pf.piece_offset,
-                path: metadata.files[pf.file_index].path.clone(),
-                file_length: metadata.files[pf.file_index].length,
-            })
-            .collect();
 
         Self {
             blocks: vec![Block::default(); num_blocks],
             downloaded_blocks: 0,
             downloading_blocks: 0,
             written,
-            hash: metadata.pieces[index],
+            hash,
             length,
-            files,
             index,
+            for_metadata,
         }
     }
 
@@ -176,7 +156,7 @@ impl Piece {
         }
     }
 
-    pub async fn place(&mut self, index: usize, block: Vec<u8>) -> Result<bool> {
+    pub fn place(&mut self, index: usize, block: Vec<u8>) -> Option<Vec<u8>> {
         match &mut self.blocks[index].state {
             state @ BlockState::Downloading { .. } => {
                 *state = BlockState::Downloaded(block);
@@ -186,11 +166,21 @@ impl Piece {
             _ => (),
         };
 
-        if self.is_downloaded() && self.write().await? {
-            return Ok(true);
+        if self.is_downloaded() {
+            if let Some(piece) = self.assemble() {
+                let correct = self.verify(&piece);
+                if !correct {
+                    self.blocks.fill(Block::default());
+                    return None;
+                }
+                // TODO: we may wanna handle write error gracefully and signal to piece that we should write
+                self.blocks.fill(Block::new(BlockState::Written));
+                self.written = true;
+                return Some(piece);
+            }
         }
 
-        Ok(false)
+        None
     }
 
     pub fn check_timeout(&mut self) -> HashMap<PeerId, usize> {
@@ -254,42 +244,13 @@ impl Piece {
     fn verify(&self, piece: &[u8]) -> bool {
         let actual_hash = Sha1::digest(piece);
         if actual_hash == self.hash.into() {
-            debug!(piece = %self.index, "Verification passed");
+            debug!(metadata = &self.for_metadata,  piece = %self.index,
+                "Verification passed");
             return true;
         } else {
-            warn!(piece = %self.index, "Verification failed");
+            warn!(metadata = &self.for_metadata,  piece = %self.index,
+                "Verification failed");
             return false;
         }
-    }
-
-    async fn write(&mut self) -> Result<bool> {
-        if let Some(piece) = self.assemble() {
-            let correct = self.verify(&piece);
-            if !correct {
-                self.blocks.fill(Block::default());
-                return Ok(false);
-            }
-            
-            for piece_file in &self.files {
-                let path = Path::new("torrents").join(&piece_file.path);
-                fs::create_dir_all(&path.parent().unwrap()).await?;
-                let mut file = fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .open(&path).await?;
-                file.set_len(piece_file.file_length as u64).await?;
-                file.seek(SeekFrom::Start(piece_file.file_offset as u64)).await?;
-                file.write_all(
-                    &piece[piece_file.piece_offset..(piece_file.piece_offset + piece_file.length)],
-                ).await?;
-                debug!(piece = %self.index, "Written to {}", &path.to_string_lossy());
-            }
-
-            self.blocks.fill(Block::new(BlockState::Written));
-            self.written = true;
-            return Ok(true);
-        }
-        Ok(false)
     }
 }
