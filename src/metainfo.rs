@@ -69,7 +69,10 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn from_bencode(info: &BencodeValue) -> Result<Self, String> {
+    pub fn from_bytes(encoded: &[u8]) -> Result<Self, String> {
+        let info = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
+            || "Unable to find root dictionary"
+        )?;
         let name = info.required_string("name")?;
         let files = MetainfoFile::from_bencode(&info, &name)?;
         let piece_length = info.required_unsigned("piece length")? as usize;
@@ -165,14 +168,15 @@ impl Metainfo {
         }
     }
     
-    pub fn from_bytes(encoded: &[u8]) -> Result<(Self, Metadata), String> {
+    pub fn from_bytes(encoded: &[u8]) -> Result<(Self, Vec}u8}), String> {
         let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
             || "Unable to find root dictionary"
         )?;
         let info = root.required("info")?;
+        let info_bytes = info.to_bytes();
 
         Ok((Metainfo {
-            info_hash: InfoHash::from(Sha1::digest(info.to_bytes()).into()),
+            info_hash: InfoHash::from(Sha1::digest(info_bytes).into()),
             announces: match root.get("announce-list") {
                 Some(announce_list) => announce_list
                     .as_list()
@@ -184,7 +188,7 @@ impl Metainfo {
             },
             created_by: root.optional_string("created by")?,
             comment: root.optional_string("comment")?,
-        }, Metadata::from_bencode(&info)?))
+        }, info_bytes))
     }
 }
 

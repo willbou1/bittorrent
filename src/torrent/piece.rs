@@ -59,11 +59,31 @@ pub struct Piece {
     written: bool,
     hash: Hash,
     length: usize,
-    index: usize,
+    index: Option<size>,
     for_metadata: bool,
 }
 
 impl Piece {
+    pub fn new(
+        for_metadata: bool,
+        length: usize,
+        hash: Hash,
+        written: bool,
+    ) -> Self {
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+
+        Self {
+            blocks: vec![Block::default(); num_blocks],
+            downloaded_blocks: 0,
+            downloading_blocks: 0,
+            written,
+            hash,
+            length,
+            index: None,
+            for_metadata,
+        }
+    }
+
     pub fn new(
         for_metadata: bool,
         index: usize,
@@ -80,9 +100,27 @@ impl Piece {
             written,
             hash,
             length,
-            index,
+            index: Some(index),
             for_metadata,
         }
+    }
+
+    pub fn set_length_and_reset(&mut self, length: usize) {
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+
+        self.downloaded_blocks = 0;
+        self.downloading_blocks = 0;
+        self.written = false;
+        self.length = length;
+        self.blocks = vec![Block::default(); num_blocks];
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+    
+    pub fn downloaded_blocks(&self) -> usize {
+        self.downloaded_blocks
     }
 
     pub fn is_available(&self) -> bool {

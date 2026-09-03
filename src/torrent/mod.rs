@@ -1,5 +1,5 @@
-mod piece;
-mod transfer;
+pub mod piece;
+pub mod transfer;
 
 use anyhow::Result;
 use tokio::{
@@ -24,7 +24,9 @@ use crate::{
     tracker::{Progress, Trackers},
     types::*,
 };
+use piece::Piece;
 
+const MAX_METADATA_REQUESTS: usize = 2;
 const BLOCK_SIZE: usize = 16 * 1024;
 const MAX_DISCOVERY_ATTEMPTS: usize = 3;
 
@@ -72,6 +74,8 @@ pub struct Connection {
     supports_pex: bool,
     supports_metadataa: bool,
     supports_dht: bool,
+
+    metadata_requests: usize,
 }
 
 impl Connection {
@@ -85,6 +89,7 @@ impl Connection {
             supports_metadataa: false,
             supports_pex: false,
             connected: true,
+            metadata_requests: 0,
         }
     }
 }
@@ -103,8 +108,7 @@ pub struct Torrent {
 
     transfer: Option<Transfer>,
 
-    metadata_bitfield: Option<PieceBitfield>,
-    metadata: Vec<u8>,
+    metadata: Piece,
 }
 
 impl Torrent {
@@ -147,8 +151,7 @@ impl Torrent {
             client_id,
             transfer: None,
             display_name,
-            metadata_bitfield: None,
-            metadata: Vec::new(),
+            metadata: Piece::new(true, 0, 0, info_hash.as_bytes().into(), true),
             discovery_attemps: Vec::new(),
         })
     }
@@ -158,7 +161,7 @@ impl Torrent {
         client_id: PeerId,
     ) -> Result<Self> {
         let file = fs::read(path).await?;
-        let (metainfo, metadata) = Metainfo::from_bytes(&file)
+        let (metainfo, metadata_bytes) = Metainfo::from_bytes(&file)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         {}
         info!("Parsed metainfo:\n{}", metainfo);
@@ -190,9 +193,8 @@ impl Torrent {
             span: span.clone(),
             client_id,
             display_name: metadata.name.clone(),
-            transfer: Some(Transfer::new(metadata).await?),
-            metadata_bitfield: None,
-            metadata: Vec::new(),
+            transfer: Some(Transfer::new(Metadata::from_bytes(metadata_bytes)?).await?),
+            metadata: Piece::new(true, 0, metadata_bytes.len(), metainfo.info_hash.as_bytes().into(), true),
             discovery_attemps: Vec::new(),
         })
     }
@@ -256,24 +258,17 @@ impl Torrent {
                 ));
         }
 
-        info!("✓ {} ⋯ {} \n{}",
+        info!("✓ {} ⋯ {} ℹ {}/{}\n{}",
             self.connections.len(),
             self.discovery_attemps.len(),
+            self.metadata.num_downloaded(), self.metadata.downloaded_blocks(),
             status);
     }
 
     async fn tick(&mut self) -> Result<()> {
-        if self.transfer.is_none() && let Some(bitfield) = &mut self.metadata_bitfield {
-            for (_, connection) in self.connections.iter_mut() {
-                if connection.supports_metadataa && connection.connected {
-                    for b in 0..bitfield.len() {
-                        warn!("Metadata {b}");
-                        connection.tx.send(Message::Metadata(MetadataMessage::Request {
-                            index: b
-                        })).await?;
-                    }
-                    break;
-                }
+        for (peer_id, count) in self.metadata.iece.check_timeout() {
+            if let Some(con) = self.connections.get_mut(&peer_id) {
+                con.sent_requests = con.sent_requests.saturating_sub(count);
             }
         }
         
@@ -322,24 +317,13 @@ impl Torrent {
         }
     }
 
-    async fn handle_metadata_message(&mut self, message: MetadataMessage) -> Result<()> {
+    async fn handle_metadata_message(&mut self, message: MetadataMessage, peer_id: &PeerId) -> Result<()> {
         match message {
             MetadataMessage::Request { .. } => (),
             MetadataMessage::Data { index, piece, total_size } => {
                 if self.transfer.is_none() {
-                    if let Some(bitfield) = &mut self.metadata_bitfield {
-                        self.metadata.resize(total_size, 0);
-                        bitfield.set_piece(index);
-                        let begin = index * BLOCK_SIZE;
-                        self.metadata[begin..(begin + BLOCK_SIZE.min(piece.len()))].copy_from_slice(&piece);
-                        let mut complete = true;
-                        for b in 0..bitfield.len() {
-                            complete &= bitfield.has_piece(b);
-                        }
-                        if complete {
-                            let metadata = Metadata::from_bencode(
-                                &BencodeValue::from_bytes(&self.metadata).unwrap().0.unwrap()
-                            ).unwrap();
+                    if let Some(metadata_bytes) = self.metadata.place(index, piece) {
+                            let metadata = Metadata::from_bytes(&metadata_bytes)?;
                             warn!("Got metadata:\n{metadata}");
                             self.transfer = Some(Transfer::new(metadata).await?);
                             for (peer_id, con) in self.connections.iter()
@@ -350,11 +334,13 @@ impl Torrent {
                                         ).await?;
                                     }
                                 }
-                        }
                     }
                 }
             },
-            MetadataMessage::Reject { .. } => {
+            MetadataMessage::Reject { index } => {
+                if self.transfer.is_none() {
+                    self.metadata.reject(index, peer_id.clone());
+                }
                 warn!("Metadata reject");
             },
             _ => (),
@@ -373,7 +359,7 @@ impl Torrent {
                     let _enter = span.enter();
                     // dispatch to transfer layer
                     match message {
-                        Message::Metadata(msg) => self.handle_metadata_message(msg).await?,
+                        Message::Metadata(msg) => self.handle_metadata_message(msg, &peer_id).await?,
 
                         Message::KeepAlive => {}
 
@@ -383,9 +369,7 @@ impl Torrent {
                             connection.supports_metadataa |= extensions.contains_key("ut_metadata");
                             connection.supports_pex |= extensions.contains_key("ut_pex");
                             if let Some(metadata_size) = metadata_size && self.metadata_bitfield.is_none() {
-                                self.metadata_bitfield = Some(
-                                    PieceBitfield::new(metadata_size.div_ceil(BLOCK_SIZE))
-                                );
+                                self.metadata.set_length_and_reset(metadata_size);
                             }
                         }
 
