@@ -7,11 +7,8 @@ use std::{
 use tracing::{info, warn, debug, trace};
 
 use crate::{
-    timer::Timer,
-    types::*,
+    bitfield::Bitfield, timer::Timer, types::*
 };
-
-type Hash = [u8; 20];
 
 const BLOCK_SIZE: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -258,7 +255,7 @@ impl Piece {
 
     fn verify(&self, piece: &[u8]) -> bool {
         let actual_hash = Sha1::digest(piece);
-        if actual_hash == self.hash.into() {
+        if actual_hash.as_slice() == self.hash.as_bytes() {
             debug!(piece = ?self.index,
                 "Verification passed");
             return true;
@@ -267,5 +264,15 @@ impl Piece {
                 "Verification failed");
             return false;
         }
+    }
+
+    pub fn to_bitfield(&self) -> Bitfield {
+        let mut bitfield = Bitfield::new(self.blocks.len());
+        for (b, block) in self.blocks.iter().enumerate() {
+            if matches!(block.state, BlockState::Downloaded(_)) {
+                bitfield.set(b);
+            }
+        }
+        bitfield
     }
 }

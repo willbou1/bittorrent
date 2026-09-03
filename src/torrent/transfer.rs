@@ -6,14 +6,14 @@ use tokio::{
 };
 use std::{
     path::{Path},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::Duration,
     io::SeekFrom,
 };
 use tracing::{info, warn, debug};
 
 use crate::{
-    bitfield::PieceBitfield,
+    bitfield::Bitfield,
     metainfo::{Metadata},
     proto::bit_torrent::Message,
     util::*,
@@ -34,7 +34,7 @@ pub struct TransferConnection {
     supports_fast: bool,
     choked: bool,
     interested: bool,
-    piece_bitfield: PieceBitfield,
+    piece_bitfield: Bitfield,
     piece_cursor: Option<usize>,
     sent_requests: usize,
     tx: mpsc::Sender<Message>,
@@ -56,7 +56,7 @@ impl TransferConnection {
             piece_cursor: None,
             choked: true,
             interested: false,
-            piece_bitfield: PieceBitfield::new(num_pieces),
+            piece_bitfield: Bitfield::new(num_pieces),
             tx,
             max_requests: DEFAULT_MAX_REQUESTS,
 
@@ -105,9 +105,9 @@ impl Transfer {
                 .open(&path).await?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
-            let bitfield = PieceBitfield::from_vec(bytes);
+            let bitfield = Bitfield::from_vec(bytes);
             for p in 0..metadata.num_pieces {
-                let written = bitfield.has_piece(p);
+                let written = bitfield.has(p);
                 if written {
                     downloaded_pieces += 1;
                 }
@@ -123,10 +123,10 @@ impl Transfer {
 
     pub async fn save_state(&self) -> Result<()> {
         info!("Saving");
-        let mut bitfield = PieceBitfield::new(self.metadata.num_pieces);
+        let mut bitfield = Bitfield::new(self.metadata.num_pieces);
         for (p, piece) in self.pieces.iter().enumerate() {
             if piece.is_written() {
-                bitfield.set_piece(p);
+                bitfield.set(p);
             }
         }
         let path = Path::new("torrents").join(format!("{}.state", self.metadata.name));
@@ -246,14 +246,14 @@ impl Transfer {
         for (_, connection) in &self.connections {
             if let Some(cursor) = connection.piece_cursor {
                 if self.pieces[cursor].is_available()
-                    && target_connection.piece_bitfield.has_piece(cursor) {
+                    && target_connection.piece_bitfield.has(cursor) {
                         return Some(cursor);
                 }
             }
         }
 
         for (p, piece) in self.pieces.iter().enumerate() {
-            if piece.is_available() && target_connection.piece_bitfield.has_piece(p) {
+            if piece.is_available() && target_connection.piece_bitfield.has(p) {
                 return Some(p);
             }
         }
@@ -286,59 +286,79 @@ impl Transfer {
     }
 
     fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
-        const PROGRESS_COLS: usize = 80;
-        
         let mut status = String::new();
         let mut downloaded_this_second = 0;
 
-        for (peer_id, connection) in self.connections.iter_mut() {
+        for (peer_id, con) in self.connections.iter_mut() {
             status.push_str(
-                &format!("    {}: {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} r/s \n",
+                &format!("    {}: {:10} {} {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} r/s\n",
                     peer_id,
-                    if connection.choked {'C'} else {'U'},
-                    if connection.interested {'I'} else {'-'},
-                    connection.max_requests,
-                    connection.sent_requests,
-                    pretty_size(connection.downloaded_this_second),
-                    connection.response_times_sum.as_secs_f64() * 1000.
-                        / connection.num_response_times as f64,
+                    con.piece_bitfield,
+                    if con.choked {'C'} else {'U'},
+                    if con.interested {'I'} else {'-'},
+                    con.piece_cursor.map(|c| format!("■ {c}")).unwrap_or(String::new()),
+                    con.max_requests,
+                    con.sent_requests,
+                    pretty_size(con.downloaded_this_second),
+                    con.response_times_sum.as_secs_f64() * 1000.
+                        / con.num_response_times as f64,
                     timeouts_this_second.get(peer_id).unwrap_or(&0),
-                    connection.chokes_this_second,
-                    connection.rejects_this_second));
+                    con.chokes_this_second,
+                    con.rejects_this_second,
+                ));
 
-            if (connection.last_download_rate as f64) > connection.downloaded_this_second as f64 * 1.3f64 {
+            if (con.last_download_rate as f64) > con.downloaded_this_second as f64 * 1.3f64 {
                 // restrict pipeline
-                connection.max_requests = (connection.max_requests - MAX_REQUESTS_STEP)
+                con.max_requests = (con.max_requests - MAX_REQUESTS_STEP)
                     .max(MIN_MAX_REQUESTS);
             }
             else {
                 // open pipeline
-                connection.max_requests = (connection.max_requests + MAX_REQUESTS_STEP)
+                con.max_requests = (con.max_requests + MAX_REQUESTS_STEP)
                     .min(MAX_MAX_REQUESTS);
             }
 
-            connection.last_download_rate = connection.downloaded_this_second;
-            downloaded_this_second += connection.downloaded_this_second;
-            connection.downloaded_this_second = 0;
-            connection.num_response_times = 0;
-            connection.response_times_sum = Duration::default();
-            connection.chokes_this_second = 0;
-            connection.rejects_this_second = 0;
+            con.last_download_rate = con.downloaded_this_second;
+            downloaded_this_second += con.downloaded_this_second;
+            con.downloaded_this_second = 0;
+            con.num_response_times = 0;
+            con.response_times_sum = Duration::default();
+            con.chokes_this_second = 0;
+            con.rejects_this_second = 0;
         }
 
-        let pieces_per_chunk = self.metadata.num_pieces / (PROGRESS_COLS * 8);
-        let chunks: Vec<_> = self.pieces.chunks(pieces_per_chunk)
-            .map(|ps| ps.iter().all(|p| p.is_written())).collect();
+        let mut pieces_bitfield = Bitfield::new(self.pieces.len());
+        for (p, piece) in self.pieces.iter().enumerate() {
+            if piece.is_written() {
+                pieces_bitfield.set(p);
+            }
+        }
 
-        status.push_str(&format!("{} {:.2}% ({}/{})",
-            chunk_progress(&chunks),
+        status.push_str(&format!(" {:90} {:.2}% ({}/{}) ⇣ {}/s\n",
+            pieces_bitfield,
             self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
             self.downloaded_pieces, self.pieces.len(),
+            pretty_size(downloaded_this_second),
         ));
 
-        info!("♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
+        let mut seen = HashSet::new();
+        let mut cursors = self.connections.iter().map(|c| c.1.piece_cursor)
+            .filter_map(|pc| pc)
+            .filter(|pc| seen.insert(*pc))
+            .collect::<Vec<_>>();
+        cursors.sort();
+        for p in cursors {
+                let piece = &self.pieces[p];
+                status.push_str(&format!("{}: {:30} {:.2}% ({}/{})\n",
+                    p,
+                    piece.to_bitfield(),
+                    piece.obtained_blocks() as f64 * 100. / piece.num_blocks() as f64,
+                    piece.obtained_blocks(), piece.num_blocks(),
+                ));
+            }
+
+        info!("♟ {} ⏱ {} to/s \n{}",
             self.connections.len(),
-            pretty_size(downloaded_this_second),
             timeouts_this_second.iter().fold(0, |acc, (k, v)| acc + v),
             status);
     }
@@ -400,7 +420,7 @@ impl Transfer {
             Message::Have { index } => {
                 self.check_piece_index(index, "have")?;
                 if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.piece_bitfield.set_piece(index);
+                    con.piece_bitfield.set(index);
                 }
                 debug!("Handled have");
             }

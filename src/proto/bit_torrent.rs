@@ -15,7 +15,7 @@ use std::{
 use tracing::{trace, warn};
 
 use crate::{
-    bitfield::PieceBitfield,
+    bitfield::Bitfield,
     torrent::{Event},
     bencode::BencodeValue,
     types::*,
@@ -35,7 +35,7 @@ pub enum Message {
 
     Choked(bool),
     Interested(bool),
-    Bitfield(PieceBitfield),
+    Bitfield(Bitfield),
     Have {
         index: usize,
     },
@@ -157,7 +157,7 @@ pub struct BitTorrent {
 impl BitTorrent {
     pub async fn handshake(
         peer_info: &PeerInfo,
-        info_hash: &InfoHash,
+        info_hash: &Hash,
         local_id: &PeerId,
     ) -> Result<Self> {
         let mut handshake = [0u8; 68];
@@ -421,7 +421,7 @@ impl BitTorrent {
                 Self::check_length(2, message_length, true, "Bitfield")?;
                 let mut bitfield = vec![0u8; message_length - 1];
                 reader.read_exact(&mut bitfield).await?;
-                Message::Bitfield(PieceBitfield::from_vec(bitfield))
+                Message::Bitfield(Bitfield::from_vec(bitfield))
             }
             4 => { // have
                 Self::check_length(1 + 4, message_length, false, "Have")?;

@@ -15,8 +15,7 @@ use std::{
 };
 
 use crate::{
-    bencode::BencodeValue,
-    bitfield::PieceBitfield,
+    bitfield::Bitfield,
     metainfo::{Metadata, Metainfo},
     proto::bit_torrent::{Message, BitTorrent},
     proto::metadata::MetadataMessage,
@@ -123,7 +122,7 @@ impl Torrent {
         let dn = pairs.find(|(n, _)| n == "dn").unwrap();
         let display_name = dn.1.into_owned();
 
-        let info_hash = InfoHash::from_xt(&xt.1).unwrap();
+        let info_hash = Hash::from_xt(&xt.1).unwrap();
         let trackers: Vec<_> = pairs.filter(|(n, _)| n == "tr")
             .map(|(_, v)| v.into_owned()).collect();
 
@@ -155,7 +154,7 @@ impl Torrent {
             client_id,
             transfer: None,
             display_name,
-            metadata: Piece::new(None, 0, info_hash.as_bytes().try_into()?, true),
+            metadata: Piece::new(None, 0, info_hash, true),
             discovery_attemps: Vec::new(),
         })
     }
@@ -199,7 +198,7 @@ impl Torrent {
             client_id,
             display_name: metadata.name.clone(),
             transfer: Some(Transfer::new(metadata).await?),
-            metadata: Piece::new(None, metadata_bytes.len(), metainfo.info_hash.as_bytes().try_into()?, true),
+            metadata: Piece::new(None, metadata_bytes.len(), metainfo.info_hash, true),
             discovery_attemps: Vec::new(),
             metainfo,
         })
@@ -233,20 +232,32 @@ impl Torrent {
 
 
     fn statistics(&mut self) {
+        const VERBOSE_DISCOVERY: bool = false;
+        
         let mut status = String::new();
 
         status.push_str("    Discovery attemps:\n        Tracker: ");
-        for attempt in self.discovery_attemps.iter()
-            .filter(|a| a.mechanism == DiscoveryMechanism::Tracker) {
-            status.push_str(
-                &format!("{} ({}) ", attempt.info, attempt.num_attempts));
+        let tracker_attemps = self.discovery_attemps.iter()
+            .filter(|a| a.mechanism == DiscoveryMechanism::Tracker);
+        if VERBOSE_DISCOVERY {
+            for attempt in tracker_attemps {
+                status.push_str(
+                    &format!("{} ({}) ", attempt.info, attempt.num_attempts));
+            }
+        } else {
+            status.push_str(&format!("{}", tracker_attemps.count()));
         }
 
         status.push_str("\n        PEX: ");
-        for attempt in self.discovery_attemps.iter()
-            .filter(|a| a.mechanism == DiscoveryMechanism::PEX) {
-            status.push_str(
-                &format!("{} ({}) ", attempt.info, attempt.num_attempts));
+        let pex_attemps = self.discovery_attemps.iter()
+            .filter(|a| a.mechanism == DiscoveryMechanism::PEX);
+        if VERBOSE_DISCOVERY {
+            for attempt in pex_attemps {
+                status.push_str(
+                    &format!("{} ({}) ", attempt.info, attempt.num_attempts));
+            }
+        } else {
+            status.push_str(&format!("{}", pex_attemps.count()));
         }
 
         status.push_str("\n    Discovered\n");
@@ -342,7 +353,9 @@ impl Torrent {
 
     async fn handle_metadata_message(&mut self, message: MetadataMessage, peer_id: &PeerId) -> Result<()> {
         match message {
-            MetadataMessage::Request { .. } => (),
+            MetadataMessage::Request { index } => {
+                warn!("Got metadata request {index}");
+            },
             MetadataMessage::Data { index, piece, total_size } => {
                 if self.transfer.is_none() {
                     if let Some(metadata_bytes) = self.metadata.place(index, piece) {

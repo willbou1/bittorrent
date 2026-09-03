@@ -10,9 +10,9 @@ use crate::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InfoHash(pub [u8; 20]);
+pub struct Hash(pub [u8; 20]);
 
-impl InfoHash {
+impl Hash {
     pub fn from(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
@@ -37,7 +37,7 @@ impl InfoHash {
     }
 }
 
-impl fmt::Display for InfoHash {
+impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0.map(|b| format!("{b:02x}")).join(""))
     }

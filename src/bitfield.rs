@@ -1,10 +1,12 @@
+use std::fmt;
+
 #[derive(Debug)]
-pub struct PieceBitfield {
+pub struct Bitfield {
     buffer: Vec<u8>,
     size: usize,
 }
 
-impl PieceBitfield {
+impl Bitfield {
     pub fn new(size: usize) -> Self {
         Self {
             buffer: vec![0; (size + 7) / 8],
@@ -35,11 +37,11 @@ impl PieceBitfield {
         0b1000_0000 >> (index % 8)
     }
 
-    pub fn has_piece(&self, index: usize) -> bool {
+    pub fn has(&self, index: usize) -> bool {
         self.buffer[index / 8] & Self::bit(index) != 0
     }
 
-    pub fn set_piece(&mut self, index: usize) {
+    pub fn set(&mut self, index: usize) {
         self.buffer[index / 8] |= Self::bit(index);
     }
 
@@ -49,7 +51,7 @@ impl PieceBitfield {
         }
     }
 
-    pub fn unset_piece(&mut self, index: usize) {
+    pub fn unset(&mut self, index: usize) {
         self.buffer[index / 8] &= !Self::bit(index);
     }
 
@@ -57,3 +59,34 @@ impl PieceBitfield {
         self.buffer.copy_from_slice(bitfield);
     }
 }
+
+impl fmt::Display for Bitfield {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const BRAILLE_BITS: [u8; 8] = [0, 1, 2, 6, 3, 4, 5, 7];
+
+        let num_cols = f.width().unwrap_or(0);
+        write!(f, "[")?;
+
+        let mut bits = 0u8;
+        let chunks = num_cols * 8;
+        let len = self.len();
+
+        for c in 0..chunks {
+            let start = c * len / chunks;
+            let end = ((c + 1) * len + chunks - 1) / chunks;
+            
+            if (start..end).all(|i| self.has(i)) {
+                bits |= 1 << BRAILLE_BITS[c % 8];
+            }
+            
+            if c % 8 == 7 {
+                write!(f, "{}", char::from_u32(0x2800 + bits as u32).unwrap())?;
+                bits = 0;
+            }
+        }
+
+        write!(f, "]")?;
+        Ok(())
+    }
+}
+

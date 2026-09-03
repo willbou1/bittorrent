@@ -58,7 +58,7 @@ pub struct PieceFile {
 pub struct Metadata {
     pub name: String,
     pub piece_length: usize,
-    pub pieces: Vec<[u8; 20]>,
+    pub pieces: Vec<Hash>,
     pub files: Vec<MetainfoFile>,
 
     // derived from metadata
@@ -77,7 +77,7 @@ impl Metadata {
         let files = MetainfoFile::from_bencode(&info, &name)?;
         let piece_length = info.required_unsigned("piece length")? as usize;
         let pieces: Vec<_> = info.required_bytes("pieces")?
-            .chunks(20).map(|chunk| chunk.try_into().unwrap())
+            .chunks(20).map(|chunk| Hash::from(chunk.try_into().unwrap()))
             .collect();
 
         let num_pieces = pieces.len();
@@ -155,11 +155,11 @@ pub struct Metainfo {
 
     pub created_by: Option<String>,
     pub comment: Option<String>,
-    pub info_hash: InfoHash,
+    pub info_hash: Hash,
 }
 
 impl Metainfo {
-    pub fn from_magnet(info_hash: InfoHash, trackers: Vec<String>) -> Self {
+    pub fn from_magnet(info_hash: Hash, trackers: Vec<String>) -> Self {
         Self {
             announces: vec![trackers],
             info_hash,
@@ -176,7 +176,7 @@ impl Metainfo {
         let info_bytes = info.to_bytes();
 
         Ok((Metainfo {
-            info_hash: InfoHash::from(Sha1::digest(&info_bytes).into()),
+            info_hash: Hash::from(Sha1::digest(&info_bytes).into()),
             announces: match root.get("announce-list") {
                 Some(announce_list) => announce_list
                     .as_list()

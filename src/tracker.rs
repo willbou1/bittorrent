@@ -83,7 +83,7 @@ impl TrackerResponse {
 
 pub struct Trackers {
     urls: Vec<Vec<String>>,
-    info_hash: InfoHash,
+    info_hash: Hash,
     client_id: PeerId,
     tx: mpsc::Sender<torrent::Event>,
     rx: mpsc::Receiver<Progress>,
@@ -105,7 +105,7 @@ impl Trackers {
         tx: mpsc::Sender<torrent::Event>,
         rx: mpsc::Receiver<Progress>,
         client_id: PeerId,
-        info_hash: InfoHash,
+        info_hash: Hash,
         mut urls: Vec<Vec<String>>,
     ) -> Self {
         for tier_urls in urls.iter_mut() {
