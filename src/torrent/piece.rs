@@ -59,13 +59,12 @@ pub struct Piece {
     written: bool,
     hash: Hash,
     length: usize,
-    index: Option<size>,
-    for_metadata: bool,
+    index: Option<usize>,
 }
 
 impl Piece {
     pub fn new(
-        for_metadata: bool,
+        index: Option<usize>,
         length: usize,
         hash: Hash,
         written: bool,
@@ -79,29 +78,7 @@ impl Piece {
             written,
             hash,
             length,
-            index: None,
-            for_metadata,
-        }
-    }
-
-    pub fn new(
-        for_metadata: bool,
-        index: usize,
-        length: usize,
-        hash: Hash,
-        written: bool,
-    ) -> Self {
-        let num_blocks = length.div_ceil(BLOCK_SIZE);
-
-        Self {
-            blocks: vec![Block::default(); num_blocks],
-            downloaded_blocks: 0,
-            downloading_blocks: 0,
-            written,
-            hash,
-            length,
-            index: Some(index),
-            for_metadata,
+            index: index,
         }
     }
 
@@ -119,8 +96,8 @@ impl Piece {
         self.blocks.len()
     }
     
-    pub fn downloaded_blocks(&self) -> usize {
-        self.downloaded_blocks
+    pub fn obtained_blocks(&self) -> usize {
+        if self.written {self.num_blocks()} else {self.downloaded_blocks}
     }
 
     pub fn is_available(&self) -> bool {
@@ -232,7 +209,7 @@ impl Piece {
                 BlockState::Downloading { timer, peer_id, .. } => {
                     if timer.elapsed() > TIMEOUT {
                         self.downloading_blocks -= 1;
-                        debug!("Block {}:{b} timed out", self.index);
+                        debug!(index = ?self.index, "Block {b} timed out");
                         *ret.entry(*peer_id).or_insert(0) += 1;
                         block.state = BlockState::Unobtained;
                     }
@@ -282,11 +259,11 @@ impl Piece {
     fn verify(&self, piece: &[u8]) -> bool {
         let actual_hash = Sha1::digest(piece);
         if actual_hash == self.hash.into() {
-            debug!(metadata = &self.for_metadata,  piece = %self.index,
+            debug!(piece = ?self.index,
                 "Verification passed");
             return true;
         } else {
-            warn!(metadata = &self.for_metadata,  piece = %self.index,
+            warn!(piece = ?self.index,
                 "Verification failed");
             return false;
         }

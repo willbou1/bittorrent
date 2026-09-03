@@ -92,6 +92,10 @@ impl Connection {
             metadata_requests: 0,
         }
     }
+
+    fn can_request_metadata(&self) -> bool {
+        self.metadata_requests < MAX_METADATA_REQUESTS
+    }
 }
 
 pub struct Torrent {
@@ -151,7 +155,7 @@ impl Torrent {
             client_id,
             transfer: None,
             display_name,
-            metadata: Piece::new(true, 0, 0, info_hash.as_bytes().into(), true),
+            metadata: Piece::new(None, 0, info_hash.as_bytes().try_into()?, true),
             discovery_attemps: Vec::new(),
         })
     }
@@ -164,6 +168,8 @@ impl Torrent {
         let (metainfo, metadata_bytes) = Metainfo::from_bytes(&file)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         {}
+        let metadata = Metadata::from_bytes(&metadata_bytes)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         info!("Parsed metainfo:\n{}", metainfo);
         info!("Parsed metadata:\n{}", metadata);
         let span = tracing::info_span!(
@@ -186,16 +192,16 @@ impl Torrent {
 
         Ok(Self {
             connections: HashMap::new(),
-            metainfo,
             peer_tx: tx,
             tracker_tx,
             rx,
             span: span.clone(),
             client_id,
             display_name: metadata.name.clone(),
-            transfer: Some(Transfer::new(Metadata::from_bytes(metadata_bytes)?).await?),
-            metadata: Piece::new(true, 0, metadata_bytes.len(), metainfo.info_hash.as_bytes().into(), true),
+            transfer: Some(Transfer::new(metadata).await?),
+            metadata: Piece::new(None, metadata_bytes.len(), metainfo.info_hash.as_bytes().try_into()?, true),
             discovery_attemps: Vec::new(),
+            metainfo,
         })
     }
 
@@ -261,16 +267,17 @@ impl Torrent {
         info!("✓ {} ⋯ {} ℹ {}/{}\n{}",
             self.connections.len(),
             self.discovery_attemps.len(),
-            self.metadata.num_downloaded(), self.metadata.downloaded_blocks(),
+            self.metadata.obtained_blocks(), self.metadata.num_blocks(),
             status);
     }
 
     async fn tick(&mut self) -> Result<()> {
-        for (peer_id, count) in self.metadata.iece.check_timeout() {
+        for (peer_id, count) in self.metadata.check_timeout() {
             if let Some(con) = self.connections.get_mut(&peer_id) {
-                con.sent_requests = con.sent_requests.saturating_sub(count);
+                con.metadata_requests = con.metadata_requests.saturating_sub(count);
             }
         }
+        self.dispatch_metadata_request().await?;
         
         self.statistics();
 
@@ -317,14 +324,31 @@ impl Torrent {
         }
     }
 
+    async fn dispatch_metadata_request(&mut self) -> Result<()> {
+        for (peer_id, con) in &self.connections {
+            while con.can_request_metadata() {
+                if let Some(index) = self.metadata.find_available_block(&peer_id) {
+                    self.metadata.download(index, peer_id.clone());
+                    con.tx .send(Message::Metadata(
+                        MetadataMessage::Request { index }
+                    )).await?;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_metadata_message(&mut self, message: MetadataMessage, peer_id: &PeerId) -> Result<()> {
         match message {
             MetadataMessage::Request { .. } => (),
             MetadataMessage::Data { index, piece, total_size } => {
                 if self.transfer.is_none() {
                     if let Some(metadata_bytes) = self.metadata.place(index, piece) {
-                            let metadata = Metadata::from_bytes(&metadata_bytes)?;
-                            warn!("Got metadata:\n{metadata}");
+                        let metadata = Metadata::from_bytes(&metadata_bytes)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            info!("Got metadata:\n{metadata}");
                             self.transfer = Some(Transfer::new(metadata).await?);
                             for (peer_id, con) in self.connections.iter()
                                 .filter(|(k, v)| v.connected) {
@@ -334,14 +358,18 @@ impl Torrent {
                                         ).await?;
                                     }
                                 }
+                    } else {
+                        self.dispatch_metadata_request().await?;
                     }
+                    info!("Got metadata block {index}");
                 }
             },
             MetadataMessage::Reject { index } => {
                 if self.transfer.is_none() {
                     self.metadata.reject(index, peer_id.clone());
+                    self.dispatch_metadata_request().await?;
                 }
-                warn!("Metadata reject");
+                info!("Got metadata reject {index}");
             },
             _ => (),
         }
@@ -368,8 +396,9 @@ impl Torrent {
                             connection.client = client;
                             connection.supports_metadataa |= extensions.contains_key("ut_metadata");
                             connection.supports_pex |= extensions.contains_key("ut_pex");
-                            if let Some(metadata_size) = metadata_size && self.metadata_bitfield.is_none() {
+                            if let Some(metadata_size) = metadata_size && self.transfer.is_none() {
                                 self.metadata.set_length_and_reset(metadata_size);
+                                self.dispatch_metadata_request().await?;
                             }
                         }
 

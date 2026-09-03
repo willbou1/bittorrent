@@ -14,13 +14,13 @@ use tracing::{info, warn, debug};
 
 use crate::{
     bitfield::PieceBitfield,
-    metainfo::{Metadata, PieceFile},
+    metainfo::{Metadata},
     proto::bit_torrent::Message,
-    util::pretty_size,
+    util::*,
     types::*,
 };
 use super::{
-    Connection, piece::Piece
+    piece::Piece
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
@@ -111,11 +111,11 @@ impl Transfer {
                 if written {
                     downloaded_pieces += 1;
                 }
-                pieces.push(Piece::new(false, p, metadata.piece_length(p), metadata.pieces[p], written));
+                pieces.push(Piece::new(Some(p), metadata.piece_length(p), metadata.pieces[p], written));
             }
         } else {
             for p in 0..metadata.num_pieces {
-                pieces.push(Piece::new(false, p, metadata.piece_length(p), metadata.pieces[p], false));
+                pieces.push(Piece::new(Some(p), metadata.piece_length(p), metadata.pieces[p], false));
             }
         }
         Ok((pieces, downloaded_pieces))
@@ -286,6 +286,8 @@ impl Transfer {
     }
 
     fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
+        const PROGRESS_COLS: usize = 80;
+        
         let mut status = String::new();
         let mut downloaded_this_second = 0;
 
@@ -324,9 +326,17 @@ impl Transfer {
             connection.rejects_this_second = 0;
         }
 
-        info!("{:.2}% ({}/{}) ♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
+        let pieces_per_chunk = self.metadata.num_pieces / (PROGRESS_COLS * 8);
+        let chunks: Vec<_> = self.pieces.chunks(pieces_per_chunk)
+            .map(|ps| ps.iter().all(|p| p.is_written())).collect();
+
+        status.push_str(&format!("{} {:.2}% ({}/{})",
+            chunk_progress(&chunks),
             self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
             self.downloaded_pieces, self.pieces.len(),
+        ));
+
+        info!("♟ {} ⇣ {}/s ⏱ {} to/s \n{}",
             self.connections.len(),
             pretty_size(downloaded_this_second),
             timeouts_this_second.iter().fold(0, |acc, (k, v)| acc + v),

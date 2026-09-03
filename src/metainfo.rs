@@ -168,7 +168,7 @@ impl Metainfo {
         }
     }
     
-    pub fn from_bytes(encoded: &[u8]) -> Result<(Self, Vec}u8}), String> {
+    pub fn from_bytes(encoded: &[u8]) -> Result<(Self, Vec<u8>), String> {
         let root = BencodeValue::from_bytes(encoded)?.0.ok_or_else(
             || "Unable to find root dictionary"
         )?;
@@ -176,7 +176,7 @@ impl Metainfo {
         let info_bytes = info.to_bytes();
 
         Ok((Metainfo {
-            info_hash: InfoHash::from(Sha1::digest(info_bytes).into()),
+            info_hash: InfoHash::from(Sha1::digest(&info_bytes).into()),
             announces: match root.get("announce-list") {
                 Some(announce_list) => announce_list
                     .as_list()
