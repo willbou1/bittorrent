@@ -334,28 +334,32 @@ impl Transfer {
             }
         }
 
-        status.push_str(&format!(" {:90} {:.2}% ({}/{}) ⇣ {}/s\n",
+        let eta = Duration::from_secs(
+            if downloaded_this_second == 0 {
+                0
+            } else {
+                ((self.metadata.length
+                    - (self.downloaded_pieces * self.metadata.piece_length).min(self.metadata.length))
+                    / downloaded_this_second) as u64
+            }
+        );
+
+        status.push_str(&format!(" {:90} {:.2}% ({}/{}) ⇣ {}/s ETA {}\n",
             pieces_bitfield,
             self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
             self.downloaded_pieces, self.pieces.len(),
             pretty_size(downloaded_this_second),
+            pretty_duration(eta),
         ));
 
-        let mut seen = HashSet::new();
-        let mut cursors = self.connections.iter().map(|c| c.1.piece_cursor)
-            .filter_map(|pc| pc)
-            .filter(|pc| seen.insert(*pc))
-            .collect::<Vec<_>>();
-        cursors.sort();
-        for p in cursors {
-                let piece = &self.pieces[p];
-                status.push_str(&format!("{}: {:30} {:.2}% ({}/{})\n",
-                    p,
-                    piece.to_bitfield(),
-                    piece.obtained_blocks() as f64 * 100. / piece.num_blocks() as f64,
-                    piece.obtained_blocks(), piece.num_blocks(),
-                ));
-            }
+        for (p, piece) in self.pieces.iter().enumerate().filter(|(_, p)|  p.is_active()) {
+            status.push_str(&format!("{}: {:30} {:.2}% ({}/{})\n",
+                p,
+                piece.to_bitfield(),
+                piece.obtained_blocks() as f64 * 100. / piece.num_blocks() as f64,
+                piece.obtained_blocks(), piece.num_blocks(),
+            ));
+        }
 
         info!("♟ {} ⏱ {} to/s \n{}",
             self.connections.len(),

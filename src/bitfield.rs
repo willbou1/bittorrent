@@ -65,7 +65,7 @@ impl fmt::Display for Bitfield {
         const BRAILLE_BITS: [u8; 8] = [0, 1, 2, 6, 3, 4, 5, 7];
 
         let num_cols = f.width().unwrap_or(0);
-        write!(f, "[")?;
+        write!(f, "[ ")?;
 
         let mut bits = 0u8;
         let chunks = num_cols * 8;
@@ -80,12 +80,15 @@ impl fmt::Display for Bitfield {
             }
             
             if c % 8 == 7 {
+                if self.len() == 0 {
+                    bits = 0;
+                }
                 write!(f, "{}", char::from_u32(0x2800 + bits as u32).unwrap())?;
                 bits = 0;
             }
         }
 
-        write!(f, "]")?;
+        write!(f, " ]")?;
         Ok(())
     }
 }

@@ -263,8 +263,28 @@ impl BitTorrent {
                 metadata_size: None,
             }, write_request_times.clone(), write_extensions.clone()).await?;
 
-            while let Some(message) = rx.recv().await {
-                Self::send(&mut writer, &name, message, write_request_times.clone(), write_extensions.clone()).await?;
+            let sleep = tokio::time::sleep(Duration::from_secs(60 * 2));
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    message = rx.recv() => {
+                        match message {
+                            Some(message) => {
+                                Self::send(&mut writer, &name, message, write_request_times.clone(), write_extensions.clone()).await?;
+                                sleep.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_secs(60 * 2)
+                                );
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ = &mut sleep => {
+                        Self::send(&mut writer, &name, Message::KeepAlive, write_request_times.clone(), write_extensions.clone()).await?;
+                        sleep.as_mut().reset(
+                            tokio::time::Instant::now() + Duration::from_secs(60 * 2)
+                        );
+                    }
+                }
             }
             
             Ok::<_, anyhow::Error>(())

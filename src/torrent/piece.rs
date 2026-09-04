@@ -67,9 +67,13 @@ impl Piece {
         written: bool,
     ) -> Self {
         let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let mut blocks = vec![Block::default(); num_blocks];
+        if written {
+            blocks.fill(Block::new(BlockState::Written));
+        }
 
         Self {
-            blocks: vec![Block::default(); num_blocks],
+            blocks,
             downloaded_blocks: 0,
             downloading_blocks: 0,
             written,
@@ -91,6 +95,10 @@ impl Piece {
 
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.downloading_blocks > 0 || self.downloaded_blocks > 0
     }
     
     pub fn obtained_blocks(&self) -> usize {
@@ -180,6 +188,8 @@ impl Piece {
 
         if self.is_downloaded() {
             if let Some(piece) = self.assemble() {
+                self.downloaded_blocks = 0;
+                self.downloading_blocks = 0;
                 let correct = self.verify(&piece);
                 if !correct {
                     self.blocks.fill(Block::default());
@@ -269,7 +279,7 @@ impl Piece {
     pub fn to_bitfield(&self) -> Bitfield {
         let mut bitfield = Bitfield::new(self.blocks.len());
         for (b, block) in self.blocks.iter().enumerate() {
-            if matches!(block.state, BlockState::Downloaded(_)) {
+            if matches!(block.state, BlockState::Downloaded(_) | BlockState::Written) {
                 bitfield.set(b);
             }
         }
