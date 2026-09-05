@@ -25,12 +25,13 @@ use super::{
     pex::PEXMessage,
 };
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 const PEX_ID: u8 = 1;
 const METADATA_ID: u8 = 2;
 
 #[derive(Debug)]
 pub enum Message {
-    // TODO send keep alive periodically
     KeepAlive,
 
     Choked(bool),
@@ -160,56 +161,65 @@ impl BitTorrent {
         info_hash: &Hash,
         local_id: &PeerId,
     ) -> Result<Self> {
-        let mut handshake = [0u8; 68];
-        let name = format!("{peer_info}");
+        // TODO Make this try all endpoints
+        match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            async {
+                let mut handshake = [0u8; 68];
+                let name = format!("{peer_info}");
 
-        let addrs = peer_info.resolve().await?;
+                let addrs = peer_info.resolve().await?;
 
-        let mut stream = TcpStream::connect(
-            addrs.iter().next().unwrap()
-        ).await?;
-        trace!(peer = %name, "Connected");
+                let mut stream = TcpStream::connect(
+                    addrs.iter().next().unwrap()
+                ).await?;
+                trace!(peer = %name, "Connected");
 
-        // Send the handshake
-        handshake[0] = 19;
-        handshake[1..20].copy_from_slice(b"BitTorrent protocol");
-        handshake[20 + 5] |= 0x10; // Advertise extensions
-        handshake[20 + 7] |= 0x04; // Advertise fast
-        handshake[20 + 7] |= 0x01; // Avertise DHT
-        handshake[28..48].copy_from_slice(info_hash.as_bytes());
-        handshake[48..68].copy_from_slice(local_id.as_bytes());
-        stream.write_all(&handshake).await?;
-        trace!(peer = %name, "Sent handshake");
+                // Send the handshake
+                handshake[0] = 19;
+                handshake[1..20].copy_from_slice(b"BitTorrent protocol");
+                handshake[20 + 5] |= 0x10; // Advertise extensions
+                handshake[20 + 7] |= 0x04; // Advertise fast
+                handshake[20 + 7] |= 0x01; // Avertise DHT
+                handshake[28..48].copy_from_slice(info_hash.as_bytes());
+                handshake[48..68].copy_from_slice(local_id.as_bytes());
+                stream.write_all(&handshake).await?;
+                trace!(peer = %name, "Sent handshake");
 
-        // Receive the handshake response and verify it is right
-        stream.read_exact(&mut handshake).await?;
-        anyhow::ensure!(
-            handshake[0] == 19,
-            "expected handshake response to start with 19"
-        );
-        anyhow::ensure!(
-            &handshake[1..20] == b"BitTorrent protocol",
-            "expected handshake response to have 'BitTorrent protocol'"
-        );
-        anyhow::ensure!(
-            &handshake[28..48] == info_hash.as_bytes(),
-            "expected handshake response to have same info hash"
-        );
-        if let Some(peer_id) = peer_info.id {
-            anyhow::ensure!(
-                &handshake[48..68] == peer_id.as_bytes(),
-                "expected handshake response to have right peer id"
-            );
+                // Receive the handshake response and verify it is right
+                stream.read_exact(&mut handshake).await?;
+                anyhow::ensure!(
+                    handshake[0] == 19,
+                    "expected handshake response to start with 19"
+                );
+                anyhow::ensure!(
+                    &handshake[1..20] == b"BitTorrent protocol",
+                    "expected handshake response to have 'BitTorrent protocol'"
+                );
+                anyhow::ensure!(
+                    &handshake[28..48] == info_hash.as_bytes(),
+                    "expected handshake response to have same info hash"
+                );
+                if let Some(peer_id) = peer_info.id {
+                    anyhow::ensure!(
+                        &handshake[48..68] == peer_id.as_bytes(),
+                        "expected handshake response to have right peer id"
+                    );
+                }
+                trace!(peer = %name, "Received handshake");
+
+                Ok(Self {
+                    stream,
+                    name,
+                    id: PeerId::from(handshake[48..68].try_into()?),
+                    supports_fast: handshake[20 + 7] & 0x04 > 0,
+                    supports_dht: handshake[20 + 7] & 0x01 > 0,
+                })
+            }
+        ).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Exceeded handshake timeout")),
         }
-        trace!(peer = %name, "Received handshake");
-
-        Ok(Self {
-            stream,
-            name,
-            id: PeerId::from(handshake[48..68].try_into()?),
-            supports_fast: handshake[20 + 7] & 0x04 > 0,
-            supports_dht: handshake[20 + 7] & 0x01 > 0,
-        })
     }
 
     pub async fn run(

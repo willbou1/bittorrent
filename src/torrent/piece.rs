@@ -122,6 +122,10 @@ impl Piece {
         self.written
     }
 
+    pub fn has_obtrined(&self, index: usize) -> bool {
+        matches!(self.blocks[index].state, BlockState::Downloaded(_) | BlockState::Written)
+    }
+
     pub fn find_available_block(&mut self, peer_id: &PeerId) -> Option<usize> {
         if !self.is_available() {
             return None;

@@ -6,7 +6,7 @@ use tokio::{
 };
 use std::{
     path::{Path},
-    collections::{HashMap, HashSet},
+    collections::{HashMap},
     time::Duration,
     io::SeekFrom,
 };
@@ -15,87 +15,57 @@ use tracing::{info, warn, debug};
 use crate::{
     bitfield::Bitfield,
     metainfo::{Metadata},
-    proto::bit_torrent::Message,
+    proto::{
+        bit_torrent::Message,
+        tracker::{Progress, Event},
+    },
     util::*,
     types::*,
 };
 use super::{
-    piece::Piece
+    piece::Piece,
+    connection::Connection,
 };
 
 const BLOCK_SIZE: usize = 16 * 1024;
-
-const DEFAULT_MAX_REQUESTS: usize = 20;
-const MIN_MAX_REQUESTS: usize = 5;
-const MAX_MAX_REQUESTS: usize = 70;
-const MAX_REQUESTS_STEP: usize = 2;
-
-pub struct TransferConnection {
-    supports_fast: bool,
-    choked: bool,
-    interested: bool,
-    piece_bitfield: Bitfield,
-    piece_cursor: Option<usize>,
-    sent_requests: usize,
-    tx: mpsc::Sender<Message>,
-    max_requests: usize,
-
-    downloaded_this_second: usize,
-    last_download_rate: usize,
-    response_times_sum: Duration,
-    num_response_times: usize,
-    chokes_this_second: usize,
-    rejects_this_second: usize,
-}
-
-impl TransferConnection {
-    fn new(tx: mpsc::Sender<Message>, num_pieces: usize, supports_fast: bool) -> Self {
-        Self {
-            supports_fast,
-            sent_requests: 0,
-            piece_cursor: None,
-            choked: true,
-            interested: false,
-            piece_bitfield: Bitfield::new(num_pieces),
-            tx,
-            max_requests: DEFAULT_MAX_REQUESTS,
-
-            downloaded_this_second: 0,
-            last_download_rate: 0,
-            num_response_times: 0,
-            response_times_sum: Duration::default(),
-            chokes_this_second: 0,
-            rejects_this_second: 0,
-        }
-    }
-
-    fn can_request(&self) -> bool {
-        self.sent_requests < self.max_requests && !self.choked
-    }
-}
+fn block_index(begin: usize) -> usize {begin / BLOCK_SIZE}
 
 pub struct Transfer {
     metadata: Metadata,
+    tracker_tx: mpsc::Sender<Progress>,
     pieces: Vec<Piece>,
+    piece_bitfield: Bitfield,
+    connections: HashMap<PeerId, Connection>,
+
     downloaded_pieces: usize,
-    connections: HashMap<PeerId, TransferConnection>,
 }
 
 impl Transfer {
-    pub async fn new(metadata: Metadata) -> Result<Self> {
-        let (pieces, downloaded_pieces) = Self::load_state(&metadata).await?;
+    pub async fn new(metadata: Metadata, tracker_tx: mpsc::Sender<Progress>) -> Result<Self> {
+        let (pieces, downloaded_pieces, piece_bitfield) = Self::load_state(&metadata).await?;
+        let downloaded = (downloaded_pieces * metadata.piece_length).min(metadata.length);
+        let left = metadata.length - downloaded;
+        let _ = tracker_tx.send(Progress {
+            downloaded,
+            left,
+            event: Event::Started,
+            uploaded: 0,
+        }).await;
         Ok(Self {
             pieces,
             metadata,
+            tracker_tx,
             downloaded_pieces,
+            piece_bitfield,
             connections: HashMap::new(),
         })
     }
 
-    async fn load_state(metadata: &Metadata) -> Result<(Vec<Piece>, usize)> {
+    async fn load_state(metadata: &Metadata) -> Result<(Vec<Piece>, usize, Bitfield)> {
         let mut pieces = vec![];
         let path = Path::new("torrents").join(format!("{}.state", metadata.name));
         let mut downloaded_pieces = 0;
+        let mut bitfield = Bitfield::new(metadata.num_pieces);
         if fs::try_exists(&path).await? {
             info!("Recovering");
             let mut file = fs::OpenOptions::new()
@@ -105,7 +75,7 @@ impl Transfer {
                 .open(&path).await?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
-            let bitfield = Bitfield::from_vec(bytes);
+            bitfield.set_bytes(&bytes);
             for p in 0..metadata.num_pieces {
                 let written = bitfield.has(p);
                 if written {
@@ -118,7 +88,7 @@ impl Transfer {
                 pieces.push(Piece::new(Some(p), metadata.piece_length(p), metadata.pieces[p], false));
             }
         }
-        Ok((pieces, downloaded_pieces))
+        Ok((pieces, downloaded_pieces, bitfield))
     }
 
     pub async fn save_state(&self) -> Result<()> {
@@ -145,11 +115,16 @@ impl Transfer {
         tx: mpsc::Sender<Message>,
         supports_fast: bool,
     ) -> Result<()> {
-        tx.send(Message::Interested(true)).await?;
-        self.connections.insert(
-            peer_id,
-            TransferConnection::new(tx, self.metadata.num_pieces, supports_fast),
-        );
+        let mut con = Connection::new(tx, self.metadata.num_pieces, supports_fast);
+        if self.downloaded_pieces == 0 && supports_fast {
+            con.send(Message::HaveNone).await;
+        } else if self.downloaded_pieces == self.metadata.num_pieces && supports_fast {
+            con.send(Message::HaveAll).await;
+        } else if self.downloaded_pieces != 0 {
+            con.send(Message::Bitfield(self.piece_bitfield.clone())).await;
+        }
+        con.set_am_interested(true).await;
+        self.connections.insert(peer_id, con);
         Ok(())
     }
 
@@ -161,20 +136,13 @@ impl Transfer {
     }
     
     pub async fn tick(&mut self) -> Result<()> {
-        let mut timeouts_this_second = HashMap::new();
         for piece in self.pieces.iter_mut() {
             for (peer_id, count) in piece.check_timeout() {
-                *timeouts_this_second.entry(peer_id).or_insert(0) += count;
-                
-                if let Some(connection) = self.connections.get_mut(&peer_id) {
-                    connection.sent_requests =
-                        connection.sent_requests.saturating_sub(count);
-                }
+                self.connections.get_mut(&peer_id) .map(|c| c.timeout(count));
             }
         }
 
-        self.statistics(&timeouts_this_second);
-        
+        self.statistics();
         self.dispatch_requests().await
     }
 
@@ -204,56 +172,31 @@ impl Transfer {
         piece_index: usize,
         block_index: usize,
     ) -> Result<()> {
-        let connection = self.connections.get(peer_id).unwrap();
-
-        anyhow::ensure!(
-            piece_index < self.metadata.num_pieces,
-            "piece index {} out of range ({} pieces)",
-            piece_index,
-            self.metadata.num_pieces,
-        );
-
         let piece_length = self.metadata.piece_length(piece_index);
-
-        let num_blocks = piece_length.div_ceil(BLOCK_SIZE);
-        anyhow::ensure!(
-            block_index < num_blocks,
-            "block index {} out of range ({} blocks)",
-            block_index,
-            num_blocks,
-        );
-
         let begin = BLOCK_SIZE * block_index;
         let length = (piece_length - begin).min(BLOCK_SIZE);
-        connection.tx.send(Message::Request {
-            index: piece_index,
-            begin: begin,
-            length: length,
-        }).await?;
+        self.connections.get_mut(peer_id).unwrap()
+            .request(piece_index, begin, length).await;
         debug!("Requested block {piece_index}:{block_index}");
-
-        self.connections.get_mut(peer_id).unwrap().sent_requests += 1;
-
         Ok(())
     }
 
-    fn find_or_keep_piece(&self, target_connection: &TransferConnection) -> Option<usize> {
+    fn find_or_keep_piece(&self, target_connection: &Connection) -> Option<usize> {
         if let Some(cursor) = target_connection.piece_cursor
             && self.pieces[cursor].is_available() {
                 return Some(cursor);
         }
         
-        for (_, connection) in &self.connections {
-            if let Some(cursor) = connection.piece_cursor {
-                if self.pieces[cursor].is_available()
-                    && target_connection.piece_bitfield.has(cursor) {
+        for con in self.connections.values() {
+            if let Some(cursor) = con.piece_cursor {
+                if self.pieces[cursor].is_available() && target_connection.has_piece(cursor) {
                         return Some(cursor);
                 }
             }
         }
 
         for (p, piece) in self.pieces.iter().enumerate() {
-            if piece.is_available() && target_connection.piece_bitfield.has(p) {
+            if piece.is_available() && target_connection.has_piece(p) {
                 return Some(p);
             }
         }
@@ -285,46 +228,34 @@ impl Transfer {
         Ok(())
     }
 
-    fn statistics(&mut self, timeouts_this_second: &HashMap<PeerId, usize>) {
+    fn downloaded_left(&self) -> (usize, usize) {
+        let downloaded = (self.downloaded_pieces * self.metadata.piece_length)
+            .min(self.metadata.length);
+        let left = self.metadata.length - downloaded;
+        (downloaded, left)
+    }
+
+    fn eta(&self, downloaded_this_second: usize) -> Duration {
+        let (_, left) = self.downloaded_left();
+        Duration::from_secs(
+            if downloaded_this_second == 0 {
+                0
+            } else {
+                (left / downloaded_this_second) as u64
+            }
+        )
+    }
+
+    fn statistics(&mut self) {
         let mut status = String::new();
         let mut downloaded_this_second = 0;
+        let mut timeouts_this_second = 0;
 
         for (peer_id, con) in self.connections.iter_mut() {
-            status.push_str(
-                &format!("    {}: {:10} {} {} {} |{} ⇢ {} ⇣ {}/s ⏱ {:.2} ms {} to/s {} c/s {} r/s\n",
-                    peer_id,
-                    con.piece_bitfield,
-                    if con.choked {'C'} else {'U'},
-                    if con.interested {'I'} else {'-'},
-                    con.piece_cursor.map(|c| format!("■ {c}")).unwrap_or(String::new()),
-                    con.max_requests,
-                    con.sent_requests,
-                    pretty_size(con.downloaded_this_second),
-                    con.response_times_sum.as_secs_f64() * 1000.
-                        / con.num_response_times as f64,
-                    timeouts_this_second.get(peer_id).unwrap_or(&0),
-                    con.chokes_this_second,
-                    con.rejects_this_second,
-                ));
-
-            if (con.last_download_rate as f64) > con.downloaded_this_second as f64 * 1.3f64 {
-                // restrict pipeline
-                con.max_requests = (con.max_requests - MAX_REQUESTS_STEP)
-                    .max(MIN_MAX_REQUESTS);
-            }
-            else {
-                // open pipeline
-                con.max_requests = (con.max_requests + MAX_REQUESTS_STEP)
-                    .min(MAX_MAX_REQUESTS);
-            }
-
-            con.last_download_rate = con.downloaded_this_second;
-            downloaded_this_second += con.downloaded_this_second;
-            con.downloaded_this_second = 0;
-            con.num_response_times = 0;
-            con.response_times_sum = Duration::default();
-            con.chokes_this_second = 0;
-            con.rejects_this_second = 0;
+            status.push_str(&format!("    {peer_id}: {con}\n"));
+            downloaded_this_second += con.downloaded_this_second();
+            timeouts_this_second += con.timeouts_this_second();
+            con.reset_stats();
         }
 
         let mut pieces_bitfield = Bitfield::new(self.pieces.len());
@@ -334,24 +265,16 @@ impl Transfer {
             }
         }
 
-        let eta = Duration::from_secs(
-            if downloaded_this_second == 0 {
-                0
-            } else {
-                ((self.metadata.length
-                    - (self.downloaded_pieces * self.metadata.piece_length).min(self.metadata.length))
-                    / downloaded_this_second) as u64
-            }
-        );
-
+        // global
         status.push_str(&format!(" {:90} {:.2}% ({}/{}) ⇣ {}/s ETA {}\n",
             pieces_bitfield,
             self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
             self.downloaded_pieces, self.pieces.len(),
             pretty_size(downloaded_this_second),
-            pretty_duration(eta),
+            pretty_duration(self.eta(downloaded_this_second)),
         ));
 
+        // blocks
         for (p, piece) in self.pieces.iter().enumerate().filter(|(_, p)|  p.is_active()) {
             status.push_str(&format!("{}: {:30} {:.2}% ({}/{})\n",
                 p,
@@ -361,9 +284,9 @@ impl Transfer {
             ));
         }
 
-        info!("♟ {} ⏱ {} to/s \n{}",
+        info!("♟ {} ⏱ {} t/s \n{}",
             self.connections.len(),
-            timeouts_this_second.iter().fold(0, |acc, (k, v)| acc + v),
+            timeouts_this_second,
             status);
     }
 
@@ -410,29 +333,22 @@ impl Transfer {
     ) -> Result<()> {
         match message {
             Message::Bitfield(bitfield) => {
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    anyhow::ensure!(
-                        bitfield.num_bytes() == con.piece_bitfield.num_bytes(),
-                        "The received bitfield should be {} bytes long, got {}",
-                        con.piece_bitfield.num_bytes(), bitfield.num_bytes()
-                    );
-                    con.piece_bitfield.set_bytes(bitfield.as_bytes());
-                }
                 debug!("Set bitfield {:?}", bitfield.as_bytes());
+                if let Some(con) = self.connections.get_mut(peer_id) {
+                    con.set_bitfield(bitfield)?;
+                }
             }
 
             Message::Have { index } => {
                 self.check_piece_index(index, "have")?;
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.piece_bitfield.set(index);
-                }
+                self.connections.get_mut(peer_id).map(|c| c.set_piece(index));
                 debug!("Handled have");
             }
 
             Message::Request { index, begin, length } => {
                 self.check_piece_length(index, begin, length, "request")?;
                 // TODO let's queue that later
-                debug!("Handled request");
+                warn!("Got request");
             }
 
             Message::Cancel { index, begin, length } => {
@@ -442,81 +358,71 @@ impl Transfer {
 
             Message::Piece { index, begin, piece: block, response_time } => {
                 self.check_piece_begin(index, begin, "piece")?;
-                let block_index = begin / BLOCK_SIZE;
+                let block_index = block_index(begin);
 
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.downloaded_this_second += block.len();
-                    if let Some(response_time) = response_time {
-                        con.response_times_sum += response_time;
-                        con.num_response_times += 1;
+                if !self.pieces[index].has_obtrined(block_index) {
+                    self.connections.get_mut(peer_id)
+                        .map(|c| c.piece(block.len(), response_time));
+
+                    if let Some(piece) = self.pieces[index].place(block_index, block) {
+                        self.write_piece(index, &piece).await?;
+                        self.piece_bitfield.set(index);
+                        self.downloaded_pieces += 1;
+                        for con in self.connections.values() {
+                            con.send(Message::Have {index}).await;
+                        }
+                        let (downloaded, left) = self.downloaded_left();
+                        let _ = self.tracker_tx.send(Progress {
+                            downloaded,
+                            left,
+                            event: Event::Started,
+                            uploaded: 0,
+                        }).await;
                     }
-                    con.sent_requests = con.sent_requests.saturating_sub(1);
+                    debug!("Got block {index}:{block_index}");
                 }
-
-                if let Some(piece) = self.pieces[index].place(block_index, block) {
-                    self.write_piece(index, &piece).await?;
-                    self.downloaded_pieces += 1;
-                }
-
-                debug!("Got block {index}:{block_index}");
             }
 
             Message::Choked(choked) => {
                 if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.choked = choked;
-                    if choked {
-                        con.chokes_this_second += 1;
-
-                        if !con.supports_fast {
-                            // All pending requests are considered invalidated
-                            for piece in self.pieces.iter_mut() {
-                                piece.reset(&peer_id);
-                            }
-                            con.sent_requests = 0;
+                    con.set_peer_choking(choked);
+                    if choked && !con.supports_fast {
+                        // All pending requests are considered invalidated
+                        for piece in self.pieces.iter_mut() {
+                            piece.reset(&peer_id);
                         }
+                        con.reset_sent_requests();
                     }
                 }
                 debug!("Set choke {choked}");
             }
             Message::Interested(interested) => {
                 if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.interested = interested;
+                    con.set_peer_interested(interested);
+                    //con.set_am_choking(false).await;
                 }
             }
 
             // extensions
             Message::Reject { index, begin, length } => {
                 self.check_piece_length(index, begin, length, "reject")?;
-                let block_index = begin / BLOCK_SIZE;
-
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.rejects_this_second += 1;
-                    con.sent_requests = con.sent_requests.saturating_sub(1);
-                }
-
+                let block_index = block_index(begin);
+                self.connections.get_mut(peer_id).map(|c| c.reject());
                 self.pieces[index].reject(block_index, peer_id.clone());
                 debug!("Got rejection for block {index}:{block_index}");
             }
             Message::HaveAll => {
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.piece_bitfield.fill(true);
-                }
+                self.connections.get_mut(peer_id).map(|c| c.set_pieces());
                 debug!("Got have all");
             },
             Message::HaveNone => {
-                if let Some(con) = self.connections.get_mut(peer_id) {
-                    con.piece_bitfield.fill(false);
-                }
+                self.connections.get_mut(peer_id).map(|c| c.unset_pieces());
                 debug!("Got have none");
             },
             Message::Suggest { index } => {
                 warn!("Got suggest for block {index}");
             },
             Message::AllowedFast { index } => (),
-
-            Message::Unsupported { type_byte } => {
-                warn!("Handle unsupported message {type_byte}");
-            }
 
             _ => (),
         }

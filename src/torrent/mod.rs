@@ -1,5 +1,7 @@
-pub mod piece;
-pub mod transfer;
+mod piece;
+mod transfer;
+mod peer;
+mod connection;
 
 use anyhow::Result;
 use tokio::{
@@ -12,7 +14,7 @@ use transfer::Transfer;
 use url::Url;
 use std::{
     collections::HashMap, path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration},
 };
 
 use crate::{
@@ -25,10 +27,9 @@ use crate::{
     types::*,
 };
 use piece::Piece;
+use peer::{Peer, PeerState};
 
-const MAX_METADATA_REQUESTS: usize = 2;
 const MAX_DISCOVERY_ATTEMPTS: usize = 3;
-const MIN_RECONNECTION_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq, Eq)]
 enum DiscoveryMechanism {
@@ -63,94 +64,10 @@ pub enum Event {
     Tracker(Vec<PeerInfo>),
 }
 
-enum ConnectionState {
-    Disconnected {
-        at: Instant,
-        interval: Duration,
-        reconnecting: bool,
-        reason: anyhow::Error,
-    },
-    Connected {
-        at: Instant,
-        sent_metadata_requests: usize,
-        tx: mpsc::Sender<Message>,
-    },
-}
-
-impl ConnectionState {
-    fn disconnect(&mut self, reason: anyhow::Error) {
-        *self = Self::Disconnected {
-            at: Instant::now(),
-            interval: MIN_RECONNECTION_INTERVAL,
-            reconnecting: false,
-            reason,
-        }
-    }
-
-    fn reconnect(&mut self, tx: mpsc::Sender<Message>) {
-        *self = Self::Connected {
-            at: Instant::now(),
-            sent_metadata_requests: 0,
-            tx
-        }
-    }
-
-    fn back_off(&mut self) {
-        if let Self::Disconnected { interval, reconnecting, at, .. } = self {
-            *interval *= 2;
-            *reconnecting = false;
-            *at = Instant::now();
-        }
-    }
-
-    fn can_request_metadata(&self) -> bool {
-        if let Self::Connected {sent_metadata_requests, ..} = self {
-            return *sent_metadata_requests < MAX_METADATA_REQUESTS;
-        }
-        false
-    }
-
-    fn decrement_metadata_requests(&mut self, count: usize) {
-        if let Self::Connected {sent_metadata_requests, ..} = self {
-            *sent_metadata_requests = sent_metadata_requests.saturating_sub(count);
-        }
-    }
-}
-
-pub struct Connection {
-    state: ConnectionState,
-    info: PeerInfo,
-    client: Option<String>,
-    supports_fast: bool,
-    supports_pex: bool,
-    supports_metadataa: bool,
-    supports_dht: bool,
-}
-
-impl Connection {
-    fn new(info: PeerInfo, tx: mpsc::Sender<Message>, supports_fast: bool, supports_dht: bool) -> Self {
-        Self {
-            client: None,
-            info,
-            supports_fast,
-            supports_dht,
-            supports_metadataa: false,
-            supports_pex: false,
-            state: ConnectionState::Connected {
-                at: Instant::now(),
-                sent_metadata_requests: 0,
-                tx
-            },
-        }
-    }
-
-}
-
 pub struct Torrent {
     metainfo: Metainfo,
-    display_name: String,
 
-    connections: HashMap<PeerId, Connection>,
+    peers: HashMap<PeerId, Peer>,
     rx: mpsc::Receiver<Event>,
     peer_tx: mpsc::Sender<Event>,
     tracker_tx: mpsc::Sender<Progress>,
@@ -194,7 +111,7 @@ impl Torrent {
         tokio::spawn(tracker_manager.run().instrument(span.clone()));
 
         Ok(Self {
-            connections: HashMap::new(),
+            peers: HashMap::new(),
             metainfo: Metainfo::from_magnet(info_hash, trackers),
             peer_tx: tx,
             tracker_tx,
@@ -202,7 +119,6 @@ impl Torrent {
             span: span.clone(),
             client_id,
             transfer: None,
-            display_name,
             metadata: Piece::new(None, 0, info_hash, true),
             discovery_attemps: Vec::new(),
         })
@@ -239,14 +155,13 @@ impl Torrent {
         tokio::spawn(trackers.run().instrument(span.clone()));
 
         Ok(Self {
-            connections: HashMap::new(),
+            peers: HashMap::new(),
             peer_tx: tx,
+            transfer: Some(Transfer::new(metadata, tracker_tx.clone()).await?),
             tracker_tx,
             rx,
             span: span.clone(),
             client_id,
-            display_name: metadata.name.clone(),
-            transfer: Some(Transfer::new(metadata).await?),
             metadata: Piece::new(None, metadata_bytes.len(), metainfo.info_hash, true),
             discovery_attemps: Vec::new(),
             metainfo,
@@ -260,9 +175,7 @@ impl Torrent {
             loop {
                 tokio::select! {
                     event = self.rx.recv() => {
-                        if let Err(e) = self.handle_event(event.unwrap()).await {
-                            warn!("Event handling error for: {e}");
-                        }
+                        self.handle_event(event.unwrap()).await?;
                     }
                     _ = interval.tick() => {
                         self.tick().await?;
@@ -310,29 +223,29 @@ impl Torrent {
         }
 
         status.push_str("\n    Discovered\n");
-        for (id, con) in self.connections.iter_mut() {
+        for (id, peer) in self.peers.iter_mut() {
             status.push_str(
-                &format!("        {} | {} | {} {} {} {} | {}\n            {}\n",
-                    match con.state {
-                        ConnectionState::Connected { .. } => "⬤",
-                        ConnectionState::Disconnected { reconnecting, .. } =>
-                        if reconnecting {"⟳"} else {"◯"},
+                &format!("        {} | {} | {}{}{}{} | {}\n            {}\n",
+                    match &peer.state {
+                        PeerState::Connected { .. } => "⬤",
+                        PeerState::Disconnected { reconnecting, .. } =>
+                        if *reconnecting {"⟳"} else {"◯"},
                     },
                     id,
-                    if con.supports_fast {"FAST"} else {"    "},
-                    if con.supports_pex {"PEX"} else {"   "},
-                    if con.supports_metadataa {"META"} else {"    "},
-                    if con.supports_dht {"DHT"} else {"   "},
-                    con.client.as_ref().unwrap_or(&String::new()),
-                    con.info,
+                    if peer.supports_fast {"F"} else {" "},
+                    if peer.supports_pex {"P"} else {" "},
+                    if peer.supports_metadataa {"M"} else {" "},
+                    if peer.supports_dht {"D"} else {" "},
+                    peer.client.as_ref().unwrap_or(&String::new()),
+                    peer.info,
                 ));
-            if let ConnectionState::Disconnected { reason, .. } = &con.state {
+            if let PeerState::Disconnected { reason, .. } = &peer.state {
                 status.push_str(&format!("            {reason}\n"));
             }
         }
 
         info!("✓ {} ⋯ {} ℹ {:2} {}/{}\n{}",
-            self.connections.len(),
+            self.peers.len(),
             self.discovery_attemps.len(),
             self.metadata.to_bitfield(),
             self.metadata.obtained_blocks(), self.metadata.num_blocks(),
@@ -341,18 +254,18 @@ impl Torrent {
 
     async fn tick(&mut self) -> Result<()> {
         for (peer_id, count) in self.metadata.check_timeout() {
-            if let Some(con) = self.connections.get_mut(&peer_id) {
-                con.state.decrement_metadata_requests(count);
+            if let Some(peer) = self.peers.get_mut(&peer_id) {
+                peer.decrement_metadata_requests(count);
             }
         }
         self.dispatch_metadata_request().await?;
 
         let mut reconnect = Vec::new();
-        for con in self.connections.values_mut() {
-            if let ConnectionState::Disconnected {at, interval, reconnecting, ..} = &mut con.state {
+        for peer in self.peers.values_mut() {
+            if let PeerState::Disconnected {at, interval, reconnecting, ..} = &mut peer.state {
                 if at.elapsed() > *interval && !*reconnecting {
                     *reconnecting = true;
-                    reconnect.push(con.info.clone());
+                    reconnect.push(peer.info.clone());
                 }
             }
         }
@@ -380,14 +293,14 @@ impl Torrent {
                 &info_hash,
                 &client_id,
             ).await {
-                Ok(peer) => tx.send(Event::Connection(peer, peer_info, known_id)).await,
+                Ok(bit_torrent) => tx.send(Event::Connection(bit_torrent, peer_info, known_id)).await,
                 Err(e) => tx.send(Event::ConnectionFailure(peer_info, e, known_id)).await,
             }
         }.instrument(self.span.clone()));
     }
 
     fn discover(&mut self, info: &PeerInfo, mechanism: DiscoveryMechanism) {
-        if self.connections.iter().all(|(_, c)| !c.info.is_same_peer(info)) {
+        if self.peers.iter().all(|(_, c)| !c.info.is_same_peer(info)) {
             match self.discovery_attemps.iter_mut().find(|a| a.info.is_same_peer(&info)) {
                 Some(attempt) => {
                     if attempt.num_attempts < MAX_DISCOVERY_ATTEMPTS {
@@ -406,14 +319,14 @@ impl Torrent {
     }
 
     async fn dispatch_metadata_request(&mut self) -> Result<()> {
-        for (peer_id, con) in &self.connections {
-            if let state @ ConnectionState::Connected { tx, .. } = &con.state {
-                while state.can_request_metadata() {
+        for (peer_id, peer) in &self.peers {
+            if let PeerState::Connected { tx, .. } = &peer.state {
+                while peer.can_request_metadata() {
                     if let Some(index) = self.metadata.find_available_block(&peer_id) {
                         self.metadata.download(index, peer_id.clone());
-                        tx.send(Message::Metadata(
+                        peer.send(Message::Metadata(
                             MetadataMessage::Request { index }
-                        )).await?;
+                        )).await;
                     } else {
                         break;
                     }
@@ -434,12 +347,12 @@ impl Torrent {
                         let metadata = Metadata::from_bytes(&metadata_bytes)
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         info!("Got metadata:\n{metadata}");
-                        self.transfer = Some(Transfer::new(metadata).await?);
+                        self.transfer = Some(Transfer::new(metadata, self.tracker_tx.clone()).await?);
                         if let Some(transfer) = &mut self.transfer {
-                            for (peer_id, con) in self.connections.iter() {
-                                if let ConnectionState::Connected { tx, .. } = &con.state {
+                            for (peer_id, peer) in self.peers.iter() {
+                                if let PeerState::Connected { tx, .. } = &peer.state {
                                     transfer.add_connection(
-                                        peer_id.clone(), tx.clone(), con.supports_fast
+                                        peer_id.clone(), tx.clone(), peer.supports_fast
                                     ).await?;
                                 }
                             }
@@ -465,10 +378,10 @@ impl Torrent {
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Message(peer_id, message) => {
-                if let Some(connection) = self.connections.get_mut(&peer_id) {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
                     let span = tracing::info_span!(
                         "connection",
-                        info = %connection.info,
+                        info = %peer.info,
                     );
                     let _enter = span.enter();
                     // dispatch to transfer layer
@@ -479,9 +392,9 @@ impl Torrent {
 
                         Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
                             debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
-                            connection.client = client;
-                            connection.supports_metadataa |= extensions.contains_key("ut_metadata");
-                            connection.supports_pex |= extensions.contains_key("ut_pex");
+                            peer.client = client;
+                            peer.supports_metadataa |= extensions.contains_key("ut_metadata");
+                            peer.supports_pex |= extensions.contains_key("ut_pex");
                             if let Some(metadata_size) = metadata_size && self.transfer.is_none() {
                                 self.metadata.set_length_and_reset(metadata_size);
                                 self.dispatch_metadata_request().await?;
@@ -499,6 +412,11 @@ impl Torrent {
                             debug!("DHT port {port}");
                         }
 
+                        Message::Unsupported { type_byte } => 
+                            warn!("Got unsupported message {type_byte}"),
+                        Message::UnsupportedExtension { type_byte } =>
+                            warn!("Got unsupported extension message {type_byte}"),
+
                         msg @ _ => {
                             if let Some(transfer) = &mut self.transfer {
                                 transfer.handle_event(&peer_id, msg).await?;
@@ -508,31 +426,31 @@ impl Torrent {
                 }
             }
 
-            Event::Connection(peer, mut info, known_id) => {
+            Event::Connection(bit_torrent, mut info, known_id) => {
                 let (tx, rx) = mpsc::channel(100);
 
                 if let Some(id) = known_id {
                     debug!(id = %id,"Reconnected");
-                    self.connections.get_mut(&id).unwrap().state.reconnect(tx.clone());
+                    self.peers.get_mut(&id).unwrap().state.reconnect(tx.clone());
                 } else {
                     self.discovery_attemps.retain(|a| a.info != info);
-                    info.id = Some(peer.id);
+                    info.id = Some(bit_torrent.id);
                     debug!(peer = %info,"Discovered");
-                    if let Some((_, m)) = self.connections.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
+                    if let Some((_, m)) = self.peers.iter_mut().find(|(_, c)| c.info.is_same_peer(&info)) {
                         m.info.merge(info.clone());
                     } else {
-                        self.connections.insert(
+                        self.peers.insert(
                             info.id.unwrap(),
-                            Connection::new(info.clone(), tx.clone(), peer.supports_fast, peer.supports_dht),
+                            Peer::new(info.clone(), tx.clone(), bit_torrent.supports_fast, bit_torrent.supports_dht),
                         );
                     }
                 }
 
                 if let Some(transfer) = &mut self.transfer {
-                    transfer.add_connection(info.id.unwrap(), tx, peer.supports_fast).await?;
+                    transfer.add_connection(info.id.unwrap(), tx, bit_torrent.supports_fast).await?;
                 }
                 tokio::spawn(
-                    peer.run(self.peer_tx.clone(), rx).instrument(self.span.clone())
+                    bit_torrent.run(self.peer_tx.clone(), rx).instrument(self.span.clone())
                 );
             }
 
@@ -540,7 +458,7 @@ impl Torrent {
                 self.discover(&peer_info, DiscoveryMechanism::Tracker);
                 if let Some(id) = known_id {
                     debug!(peer = %peer_info, "Couldn't reconnect ({e})");
-                    self.connections.get_mut(&id).unwrap().state.back_off();
+                    self.peers.get_mut(&id).unwrap().state.back_off();
                 } else {
                     debug!(peer = %peer_info, "Couldn't discover ({e})");
                 }
@@ -550,8 +468,8 @@ impl Torrent {
                 if let Some(transfer) = &mut self.transfer {
                     transfer.sever_connection(&peer_id);
                 }
-                let con = self.connections.get_mut(&peer_id).unwrap();
-                con.state.disconnect(error);
+                let peer = self.peers.get_mut(&peer_id).unwrap();
+                peer.state.disconnect(error);
             }
 
             Event::Tracker(peer_infos) => {

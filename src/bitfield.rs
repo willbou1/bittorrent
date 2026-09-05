@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Bitfield {
     buffer: Vec<u8>,
     size: usize,
