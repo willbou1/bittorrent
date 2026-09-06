@@ -1,12 +1,12 @@
 mod piece;
-mod transfer;
 mod peer;
-mod connection;
+mod transfer;
 
 use anyhow::Result;
 use tokio::{
     fs,
     sync::mpsc,
+    sync::watch,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, debug, Instrument, Span};
@@ -23,13 +23,16 @@ use crate::{
     proto::metadata::MetadataMessage,
     proto::pex::PEXMessage,
     tracker::{Trackers},
-    proto::tracker::Progress,
+    proto::tracker::{Progress, self},
     types::*,
 };
 use piece::Piece;
 use peer::{Peer, PeerState};
 
 const MAX_DISCOVERY_ATTEMPTS: usize = 3;
+
+const PEER_CHANNEL_CAPACITY: usize = 100;
+const EVENT_CHANNEL_CAPACITY: usize = 400;
 
 #[derive(PartialEq, Eq)]
 enum DiscoveryMechanism {
@@ -70,7 +73,7 @@ pub struct Torrent {
     peers: HashMap<PeerId, Peer>,
     rx: mpsc::Receiver<Event>,
     peer_tx: mpsc::Sender<Event>,
-    tracker_tx: mpsc::Sender<Progress>,
+    tracker_tx: watch::Sender<Progress>,
     client_id: PeerId,
     span: Span,
     discovery_attemps: Vec<DiscoveryAttempt>,
@@ -98,9 +101,14 @@ impl Torrent {
         );
         let _enter = span.enter();
 
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let (tracker_tx, tracker_rx) = mpsc::channel(10);
+        let (tracker_tx, tracker_rx) = watch::channel(Progress {
+            downloaded: 0,
+            uploaded: 0,
+            left: 0,
+            event: tracker::Event::None,
+        });
         let tracker_manager = Trackers::new(
             tx.clone(),
             tracker_rx,
@@ -108,7 +116,11 @@ impl Torrent {
             info_hash,
             vec![trackers.clone()],
         );
-        tokio::spawn(tracker_manager.run().instrument(span.clone()));
+
+        tokio::task::Builder::new()
+            .name("trackers")
+            .spawn(tracker_manager.run().instrument(span.clone()))
+            .unwrap();
 
         Ok(Self {
             peers: HashMap::new(),
@@ -142,9 +154,14 @@ impl Torrent {
         );
         let _enter = span.enter();
 
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let (tracker_tx, tracker_rx) = mpsc::channel(10);
+        let (tracker_tx, tracker_rx) = watch::channel(Progress {
+            downloaded: 0,
+            uploaded: 0,
+            left: 0,
+            event: tracker::Event::None,
+        });
         let trackers = Trackers::new(
             tx.clone(),
             tracker_rx,
@@ -152,7 +169,10 @@ impl Torrent {
             metainfo.info_hash,
             metainfo.announces.clone(),
         );
-        tokio::spawn(trackers.run().instrument(span.clone()));
+        tokio::task::Builder::new()
+            .name("trackers")
+            .spawn(trackers.run().instrument(span.clone()))
+            .unwrap();
 
         Ok(Self {
             peers: HashMap::new(),
@@ -253,12 +273,14 @@ impl Torrent {
     }
 
     async fn tick(&mut self) -> Result<()> {
-        for (peer_id, count) in self.metadata.check_timeout() {
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
-                peer.decrement_metadata_requests(count);
+        if self.transfer.is_none() {
+            for (peer_id, count) in self.metadata.check_timeout() {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.sub_sent_metadata_requests(count);
+                }
             }
+            self.dispatch_metadata_request().await?;
         }
-        self.dispatch_metadata_request().await?;
 
         let mut reconnect = Vec::new();
         for peer in self.peers.values_mut() {
@@ -287,16 +309,23 @@ impl Torrent {
         let peer_info = info.clone();
         let info_hash = self.metainfo.info_hash.clone();
         let client_id = self.client_id.clone();
-        tokio::spawn(async move {
-            match BitTorrent::handshake(
-                &peer_info,
-                &info_hash,
-                &client_id,
-            ).await {
-                Ok(bit_torrent) => tx.send(Event::Connection(bit_torrent, peer_info, known_id)).await,
-                Err(e) => tx.send(Event::ConnectionFailure(peer_info, e, known_id)).await,
-            }
-        }.instrument(self.span.clone()));
+        tokio::task::Builder::new()
+            .name(if known_id.is_some() {
+                "Reconnection"
+            } else {
+                "Discovery"
+            })
+            .spawn(async move {
+                match BitTorrent::handshake(
+                    &peer_info,
+                    &info_hash,
+                    &client_id,
+                ).await {
+                    Ok(bit_torrent) => tx.send(Event::Connection(bit_torrent, peer_info, known_id)).await,
+                    Err(e) => tx.send(Event::ConnectionFailure(peer_info, e, known_id)).await,
+                }
+            }.instrument(self.span.clone()))
+            .unwrap();
     }
 
     fn discover(&mut self, info: &PeerInfo, mechanism: DiscoveryMechanism) {
@@ -319,17 +348,13 @@ impl Torrent {
     }
 
     async fn dispatch_metadata_request(&mut self) -> Result<()> {
-        for (peer_id, peer) in &self.peers {
-            if let PeerState::Connected { tx, .. } = &peer.state {
-                while peer.can_request_metadata() {
-                    if let Some(index) = self.metadata.find_available_block(&peer_id) {
-                        self.metadata.download(index, peer_id.clone());
-                        peer.send(Message::Metadata(
-                            MetadataMessage::Request { index }
-                        )).await;
-                    } else {
-                        break;
-                    }
+        for (peer_id, peer) in &mut self.peers {
+            while peer.can_request_metadata() {
+                if let Some(index) = self.metadata.find_available_block(&peer_id) {
+                    self.metadata.download(index, peer_id.clone());
+                    peer.request_metadata(index).await;
+                } else {
+                    break;
                 }
             }
         }
@@ -342,10 +367,11 @@ impl Torrent {
                 warn!("Got metadata request {index}");
             },
             MetadataMessage::Data { index, piece, total_size } => {
-                if self.transfer.is_none() {
+                if self.transfer.is_none() && !self.metadata.has_obtrined(index) {
+                    self.peers.get_mut(peer_id).map(|p| p.sub_sent_metadata_requests(1));
                     if let Some(metadata_bytes) = self.metadata.place(index, piece) {
                         let metadata = Metadata::from_bytes(&metadata_bytes)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            .map_err(|e| anyhow::anyhow!("Error parsing metadata: {e}"))?;
                         info!("Got metadata:\n{metadata}");
                         self.transfer = Some(Transfer::new(metadata, self.tracker_tx.clone()).await?);
                         if let Some(transfer) = &mut self.transfer {
@@ -381,7 +407,7 @@ impl Torrent {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     let span = tracing::info_span!(
                         "connection",
-                        info = %peer.info,
+                        id = %peer_id,
                     );
                     let _enter = span.enter();
                     // dispatch to transfer layer
@@ -427,7 +453,7 @@ impl Torrent {
             }
 
             Event::Connection(bit_torrent, mut info, known_id) => {
-                let (tx, rx) = mpsc::channel(100);
+                let (tx, rx) = mpsc::channel(PEER_CHANNEL_CAPACITY);
 
                 if let Some(id) = known_id {
                     debug!(id = %id,"Reconnected");
@@ -449,9 +475,12 @@ impl Torrent {
                 if let Some(transfer) = &mut self.transfer {
                     transfer.add_connection(info.id.unwrap(), tx, bit_torrent.supports_fast).await?;
                 }
-                tokio::spawn(
-                    bit_torrent.run(self.peer_tx.clone(), rx).instrument(self.span.clone())
-                );
+                tokio::task::Builder::new()
+                    .name("BitTorrent")
+                    .spawn(
+                        bit_torrent.run(self.peer_tx.clone(), rx).instrument(self.span.clone())
+                    )
+                    .unwrap();
             }
 
             Event::ConnectionFailure(peer_info, e, known_id) => {

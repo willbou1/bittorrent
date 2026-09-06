@@ -75,7 +75,13 @@ impl fmt::Display for Bitfield {
             let start = c * len / chunks;
             let end = ((c + 1) * len + chunks - 1) / chunks;
             
-            if (start..end).all(|i| self.has(i)) {
+            let filled = if f.alternate() {
+                (start..end).any(|i| self.has(i))
+            } else {
+                (start..end).all(|i| self.has(i))
+            };
+            
+            if filled {
                 bits |= 1 << BRAILLE_BITS[c % 8];
             }
             

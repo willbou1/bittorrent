@@ -9,7 +9,12 @@ pub fn pretty_size(size: usize) -> String {
         size /= 1000.;
         unit += 1;
     }
-    format!("{size:.2} {}", UNITS[unit])
+
+    if size == 0. {
+        String::from("0 B")
+    } else {
+        format!("{size:.2} {}", UNITS[unit])
+    }
 }
 
 pub fn pretty_duration(duration: Duration) -> String {

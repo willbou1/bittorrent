@@ -7,7 +7,7 @@ use std::{
 use tracing::{warn, debug};
 
 use crate::{
-    proto::bit_torrent::Message,
+    proto::{bit_torrent::Message, metadata::MetadataMessage},
     types::*,
 };
 
@@ -89,7 +89,7 @@ impl Peer {
         false
     }
 
-    pub fn decrement_metadata_requests(&mut self, count: usize) {
+    pub fn sub_sent_metadata_requests(&mut self, count: usize) {
         if let PeerState::Connected {sent_metadata_requests, ..} = &mut self.state {
             *sent_metadata_requests = sent_metadata_requests.saturating_sub(count);
         }
@@ -100,6 +100,15 @@ impl Peer {
             if let Err(_) = tx.send(msg).await {
                 debug!("Tried to send message to a closed channel");
             }
+        }
+    }
+
+    pub async fn request_metadata(&mut self, index: usize) {
+        self.send(Message::Metadata(
+            MetadataMessage::Request { index }
+        )).await;
+        if let PeerState::Connected {sent_metadata_requests, ..} = &mut self.state {
+            *sent_metadata_requests += 1;
         }
     }
 }

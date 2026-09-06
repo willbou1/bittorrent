@@ -88,6 +88,7 @@ impl fmt::Display for TrackerResponse {
     }
 }
 
+#[derive(Clone)]
 pub struct Progress {
     pub downloaded: usize,
     pub uploaded: usize,

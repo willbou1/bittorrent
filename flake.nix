@@ -10,10 +10,12 @@
             in with pkgs; {
                 devShell = mkShell {
                     packages = with pkgs; [
+                        gdb
                         rust-analyzer
                         cargo
                         rustc
                         pkg-config
+                        tokio-console
                     ];
                     buildInputs = [
                         openssl_3

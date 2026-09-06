@@ -563,11 +563,7 @@ impl BitTorrent {
                         MetadataMessage::from_bytes(&payload[1..])
                             .map_err(|e| anyhow::anyhow!("{e}"))?
                     ),
-                    _ => {
-                        let mut payload = vec![0u8; message_length - 1];
-                        reader.read_exact(&mut payload).await?;
-                        Message::UnsupportedExtension { type_byte: payload[0] }
-                    }
+                    _ => Message::UnsupportedExtension { type_byte: payload[0] },
                 }
             }
 

@@ -97,6 +97,26 @@ impl Piece {
         self.blocks.len()
     }
 
+    pub fn num_downloading(&self) -> HashMap<PeerId, usize> {
+        let mut nums = HashMap::new();
+        for block in &self.blocks {
+            match &block.state {
+                BlockState::Downloading { peer_id, .. } => {
+                    *nums.entry(*peer_id).or_insert(0) += 1;
+                }
+                _ => (),
+            }
+        }
+        nums
+    }
+
+    pub fn who_downloading(&self, index: usize) -> Option<&PeerId> {
+        if let BlockState::Downloading { peer_id, .. } = &self.blocks[index].state {
+            return Some(peer_id);
+        }
+        None
+    }
+
     pub fn is_active(&self) -> bool {
         self.downloading_blocks > 0 || self.downloaded_blocks > 0
     }
@@ -140,7 +160,6 @@ impl Piece {
                                 block.rejects.remove(&peer_id);
                                 return Some(b);
                             }
-                            continue;
                         }
                         None => return Some(b),
                     }
@@ -220,6 +239,11 @@ impl Piece {
                 BlockState::Downloading { timer, peer_id, .. } => {
                     if timer.elapsed() > TIMEOUT {
                         self.downloading_blocks -= 1;
+                        let span = tracing::info_span!(
+                            "connection",
+                            id = %peer_id,
+                        );
+                        let _enter = span.enter();
                         debug!(index = ?self.index, "Block {b} timed out");
                         *ret.entry(*peer_id).or_insert(0) += 1;
                         block.state = BlockState::Unobtained;

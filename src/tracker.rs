@@ -5,8 +5,9 @@ use std::{
     fmt,
     time::{Duration},
 };
-use tokio::{
-    sync::mpsc,
+use tokio::sync::{
+    mpsc,
+    watch,
 };
 
 use crate::{
@@ -20,7 +21,7 @@ pub struct Trackers {
     info_hash: Hash,
     client_id: PeerId,
     tx: mpsc::Sender<torrent::Event>,
-    rx: mpsc::Receiver<Progress>,
+    rx: watch::Receiver<Progress>,
 
     pub interval: Option<u64>,
     pub min_interval: Option<u64>,
@@ -34,7 +35,7 @@ pub struct Trackers {
 impl Trackers {
     pub fn new(
         tx: mpsc::Sender<torrent::Event>,
-        rx: mpsc::Receiver<Progress>,
+        rx: watch::Receiver<Progress>,
         client_id: PeerId,
         info_hash: Hash,
         mut urls: Vec<Vec<String>>,
@@ -81,9 +82,9 @@ impl Trackers {
                     );
                 }
 
-                progress = self.rx.recv() => match progress {
-                    Some(progress) => self.progress = progress,
-                    None => {
+                result = self.rx.changed() => match result {
+                    Ok(()) => self.progress = self.rx.borrow().clone(),
+                    Err(_) => {
                         trace!("Quitting tracker loop");
                         return;
                     }
