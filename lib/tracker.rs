@@ -1,6 +1,6 @@
 use rand::seq::SliceRandom;
 use anyhow::Result;
-use tracing::{info, trace, warn, debug};
+use tracing::{Instrument, debug, info, trace, warn};
 use std::{
     fmt,
     time::{Duration},
@@ -62,35 +62,39 @@ impl Trackers {
     }
 
     pub async fn run(mut self) {
-        self.announce().await;
+        let span = tracing::info_span!("trackers");
+        let _enter = span.enter();
+        async {
+            self.announce().await;
 
-        let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(
-            self.interval.unwrap_or(60)
-                .max(self.min_interval.unwrap_or(0))
-        )));
-        loop {
-            tokio::select!(
-                _ = &mut sleep => {
-                    self.announce().await;
+            let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(
+                self.interval.unwrap_or(60)
+                    .max(self.min_interval.unwrap_or(0))
+            )));
+            loop {
+                tokio::select!(
+                    _ = &mut sleep => {
+                        self.announce().await;
 
-                    sleep.as_mut().reset(
-                        tokio::time::Instant::now()
-                        + Duration::from_secs(
-                            self.interval.unwrap_or(60)
-                            .max(self.min_interval.unwrap_or(0))
-                        )
-                    );
-                }
-
-                result = self.rx.changed() => match result {
-                    Ok(()) => self.progress = self.rx.borrow().clone(),
-                    Err(_) => {
-                        trace!("Quitting tracker loop");
-                        return;
+                        sleep.as_mut().reset(
+                            tokio::time::Instant::now()
+                            + Duration::from_secs(
+                                self.interval.unwrap_or(60)
+                                .max(self.min_interval.unwrap_or(0))
+                            )
+                        );
                     }
-                }
-            );
-        }
+
+                    result = self.rx.changed() => match result {
+                        Ok(()) => self.progress = self.rx.borrow().clone(),
+                        Err(_) => {
+                            trace!("Quitting tracker loop");
+                            return;
+                        }
+                    }
+                );
+            }
+        }.instrument(span.clone()).await
     }
 
     fn reset(&mut self) {
@@ -102,7 +106,6 @@ impl Trackers {
 
     async fn announce(&mut self) {
         const ANNOUNCE_TO_ALL_TIERS: bool = true;
-        
         let mut discovered = false;
 
         for t in 0..self.urls.len() {
@@ -114,50 +117,57 @@ impl Trackers {
             let mut bad = Vec::new();
             for u in 0..self.urls[t].len() {
                 let url = self.urls[t][u].clone();
-                match match url.split(":").next().unwrap() {
-                    "http" | "https" => request_http(
-                        &url,
-                        &self.client_id,
-                        &self.info_hash,
-                        &self.progress,
-                    ).await,
-                    "udp" => match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        request_udp(
+                let span = tracing::info_span!(
+                    "tracker",
+                    url = %url
+                );
+                async {
+                    match match url.split(":").next().unwrap() {
+                        "http" | "https" => request_http(
                             &url,
                             &self.client_id,
                             &self.info_hash,
                             &self.progress,
-                        ),
-                    ).await {
-                        Ok(response) => response,
-                        Err(_) => Err(anyhow::anyhow!("Exceeded tracker manager timeout for UDP")),
-                    },
-                    proto => Err(anyhow::anyhow!("Unsopported protocol {proto}")),
-                } {
-                    Ok(response) => {
-                        self.update(response);
-                        debug!(tracker = %url, "Successfully announced");
-                        good.push(url);
-                        discovered = true;
+                        ).await,
+                        "udp" => match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            request_udp(
+                                &url,
+                                &self.client_id,
+                                &self.info_hash,
+                                &self.progress,
+                            ),
+                        ).await {
+                            Ok(response) => response,
+                            Err(_) => Err(anyhow::anyhow!("Exceeded tracker manager timeout for UDP")),
+                        },
+                        proto => Err(anyhow::anyhow!("Unsopported protocol {proto}")),
+                    } {
+                        Ok(response) => {
+                            self.update(response);
+                            debug!("Successfully announced");
+                            good.push(url);
+                            discovered = true;
+                        }
+                        Err(e) => {
+                            debug!("Failed to announced {e}");
+                            bad.push(url);
+                        }
                     }
-                    Err(e) => {
-                        debug!(tracker = %url, "Failed to announced {e}");
-                        bad.push(url);
-                    }
-                }
-                let _ = self.tx.send(torrent::Event::Tracker(self.peers.clone())).await;
+                    let _ = self.tx.send(torrent::Event::Tracker(self.peers.clone())).await;
+                }.instrument(span).await
             }
             good.extend(bad);
             self.urls[t] = good;
 
             if discovered {
-                debug!(tier = &t, "Successfully announced tier\n{self}");
+                debug!(tier = &t, "Successfully announced to tier tier\n{self}");
                 if !ANNOUNCE_TO_ALL_TIERS {
                     return;
                 }
             }
         }
+        debug!("Successfully announced to all tiers");
     }
 
     fn update(&mut self, response: TrackerResponse) {

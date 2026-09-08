@@ -1,6 +1,7 @@
 mod piece;
 mod peer;
 mod transfer;
+pub mod control;
 
 use anyhow::Result;
 use tokio::{
@@ -18,16 +19,13 @@ use std::{
 };
 
 use crate::{
-    metainfo::{Metadata, Metainfo},
-    proto::bit_torrent::{Message, BitTorrent},
-    proto::metadata::MetadataMessage,
-    proto::pex::PEXMessage,
-    tracker::{Trackers},
-    proto::tracker::{Progress, self},
-    types::*,
+    bitfield::Bitfield, metainfo::{Metadata, Metainfo}, proto::{bit_torrent::{BitTorrent, Message}, metadata::MetadataMessage, pex::PEXMessage, tracker}, tracker::Trackers, types::*
 };
 use piece::Piece;
 use peer::{Peer, PeerState};
+use control::*;
+
+const METADATA_BLOCK_SIZE: usize = 16 * 1024;
 
 const MAX_DISCOVERY_ATTEMPTS: usize = 3;
 
@@ -57,7 +55,7 @@ impl DiscoveryAttempt {
     }
 }
 
-pub enum Event {
+pub(crate) enum Event {
     Message(PeerId, Message),
 
     Connection(BitTorrent, PeerInfo, Option<PeerId>),
@@ -73,7 +71,7 @@ pub struct Torrent {
     peers: HashMap<PeerId, Peer>,
     rx: mpsc::Receiver<Event>,
     peer_tx: mpsc::Sender<Event>,
-    tracker_tx: watch::Sender<Progress>,
+    tracker_tx: watch::Sender<tracker::Progress>,
     client_id: PeerId,
     span: Span,
     discovery_attemps: Vec<DiscoveryAttempt>,
@@ -81,6 +79,11 @@ pub struct Torrent {
     transfer: Option<Transfer>,
 
     metadata: Piece,
+
+    pub command_tx: mpsc::Sender<Command>,
+    command_rx: mpsc::Receiver<Command>,
+    pub progress_rx: watch::Receiver<Progress>,
+    progress_tx: watch::Sender<Progress>,
 }
 
 impl Torrent {
@@ -97,13 +100,13 @@ impl Torrent {
 
         let span = tracing::info_span!(
             "torrent",
-            name = %display_name,
+            display_name = %display_name,
         );
         let _enter = span.enter();
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let (tracker_tx, tracker_rx) = watch::channel(Progress {
+        let (tracker_tx, tracker_rx) = watch::channel(tracker::Progress {
             downloaded: 0,
             uploaded: 0,
             left: 0,
@@ -122,6 +125,18 @@ impl Torrent {
             .spawn(tracker_manager.run().instrument(span.clone()))
             .unwrap();
 
+        let (progress_tx, progress_rx) = watch::channel(Progress {
+            display_name,
+            num_peers: 0,
+            num_connected_peers: 0,
+            num_discovery_attempts: 0,
+            transfer: None,
+            metadata_down_speed: 0,
+            metadata_up_speed: 0,
+            metadata_bitfield: None,
+        });
+        let (command_tx, command_rx) = mpsc::channel(10);
+
         Ok(Self {
             peers: HashMap::new(),
             metainfo: Metainfo::from_magnet(info_hash, trackers),
@@ -131,8 +146,13 @@ impl Torrent {
             span: span.clone(),
             client_id,
             transfer: None,
-            metadata: Piece::new(None, 0, info_hash, true),
+            metadata: Piece::new(None, METADATA_BLOCK_SIZE, 0, info_hash, false),
             discovery_attemps: Vec::new(),
+
+            progress_rx,
+            progress_tx,
+            command_rx,
+            command_tx
         })
     }
 
@@ -150,13 +170,13 @@ impl Torrent {
         info!("Parsed metadata:\n{}", metadata);
         let span = tracing::info_span!(
             "torrent",
-            name = %metadata.name,
+            display_name = %metadata.name,
         );
         let _enter = span.enter();
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let (tracker_tx, tracker_rx) = watch::channel(Progress {
+        let (tracker_tx, tracker_rx) = watch::channel(tracker::Progress {
             downloaded: 0,
             uploaded: 0,
             left: 0,
@@ -174,21 +194,38 @@ impl Torrent {
             .spawn(trackers.run().instrument(span.clone()))
             .unwrap();
 
+        let (progress_tx, progress_rx) = watch::channel(Progress {
+            display_name: metadata.name.clone(),
+            num_peers: 0,
+            num_connected_peers: 0,
+            num_discovery_attempts: 0,
+            transfer: None,
+            metadata_bitfield: None,
+            metadata_down_speed: 0,
+            metadata_up_speed: 0,
+        });
+        let (command_tx, command_rx) = mpsc::channel(10);
+
         Ok(Self {
             peers: HashMap::new(),
             peer_tx: tx,
-            transfer: Some(Transfer::new(metadata, tracker_tx.clone()).await?),
+            transfer: Some(Transfer::new(metadata, tracker_tx.clone(), progress_tx.clone()).await?),
             tracker_tx,
             rx,
             span: span.clone(),
             client_id,
-            metadata: Piece::new(None, metadata_bytes.len(), metainfo.info_hash, true),
+            metadata: Piece::from_slice(METADATA_BLOCK_SIZE, metainfo.info_hash, &metadata_bytes),
             discovery_attemps: Vec::new(),
             metainfo,
+
+            progress_rx,
+            progress_tx,
+            command_rx,
+            command_tx
         })
     }
 
-    pub async fn run(&mut self, token: CancellationToken) -> Result<()> {
+    pub async fn run(&mut self,) -> Result<()> {
         let span = self.span.clone();
         async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -200,11 +237,16 @@ impl Torrent {
                     _ = interval.tick() => {
                         self.tick().await?;
                     }
-                    _ = token.cancelled() => {
-                        if let Some(transfer) = &self.transfer {
-                            transfer.save_state().await?;
+                    command = self.command_rx.recv() => {
+                        match command {
+                            Some(Command::Stop) | None => {
+                                if let Some(transfer) = &mut self.transfer {
+                                    transfer.save_state().await?;
+                                }
+                                break;
+                            }
+                            Some(command) => self.handle_command(command),
                         }
-                        break;
                     }
                 }
             }
@@ -212,6 +254,9 @@ impl Torrent {
         }.instrument(span).await
     }
 
+    fn handle_command(&mut self, command: Command) {
+        
+    }
 
     fn statistics(&mut self) {
         const VERBOSE_DISCOVERY: bool = false;
@@ -242,6 +287,8 @@ impl Torrent {
             status.push_str(&format!("{}", pex_attemps.count()));
         }
 
+        let mut uploaded_metadata_this_second = 0;
+        let mut downloaded_metadata_this_second = 0;
         status.push_str("\n    Discovered\n");
         for (id, peer) in self.peers.iter_mut() {
             status.push_str(
@@ -254,7 +301,7 @@ impl Torrent {
                     id,
                     if peer.supports_fast {"F"} else {" "},
                     if peer.supports_pex {"P"} else {" "},
-                    if peer.supports_metadataa {"M"} else {" "},
+                    if peer.supports_metadata {"M"} else {" "},
                     if peer.supports_dht {"D"} else {" "},
                     peer.client.as_ref().unwrap_or(&String::new()),
                     peer.info,
@@ -262,22 +309,26 @@ impl Torrent {
             if let PeerState::Disconnected { reason, .. } = &peer.state {
                 status.push_str(&format!("            {reason}\n"));
             }
+            uploaded_metadata_this_second += peer.uploaded_metadata_this_second();
+            downloaded_metadata_this_second += peer.downloaded_metadata_this_second();
+            peer.reset_statistics();
         }
 
-        info!("✓ {} ⋯ {} ℹ {:2} {}/{}\n{}",
-            self.peers.len(),
-            self.discovery_attemps.len(),
-            self.metadata.to_bitfield(),
-            self.metadata.obtained_blocks(), self.metadata.num_blocks(),
+        self.progress_tx.send_modify(|p| {
+            p.metadata_bitfield = Some(self.metadata.to_bitfield());
+            p.metadata_down_speed = METADATA_BLOCK_SIZE * downloaded_metadata_this_second;
+            p.metadata_up_speed = METADATA_BLOCK_SIZE * uploaded_metadata_this_second;
+        });
+
+        info!("\n{}",
             status);
     }
 
     async fn tick(&mut self) -> Result<()> {
         if self.transfer.is_none() {
             for (peer_id, count) in self.metadata.check_timeout() {
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    peer.sub_sent_metadata_requests(count);
-                }
+                self.peers.entry(peer_id)
+                    .and_modify(|p| p.timeout_metadata(count));
             }
             self.dispatch_metadata_request().await?;
         }
@@ -351,6 +402,12 @@ impl Torrent {
         for (peer_id, peer) in &mut self.peers {
             while peer.can_request_metadata() {
                 if let Some(index) = self.metadata.find_available_block(&peer_id) {
+                    let span = tracing::info_span!(
+                        "peer",
+                        id = %peer_id,
+                    );
+                    let _enter = span.enter();
+                    debug!("Requested metadata {index}");
                     self.metadata.download(index, peer_id.clone());
                     peer.request_metadata(index).await;
                 } else {
@@ -364,35 +421,63 @@ impl Torrent {
     async fn handle_metadata_message(&mut self, message: MetadataMessage, peer_id: &PeerId) -> Result<()> {
         match message {
             MetadataMessage::Request { index } => {
-                warn!("Got metadata request {index}");
+                debug!("Got metadata request {index}");
+                if let Some(peer) = self.peers.get_mut(peer_id) && self.metadata.num_blocks() != 0 {
+                    if let Some(piece) = self.metadata.get(index) {
+                        debug!("Sent metadata {index}");
+                        peer.send_metadata(index, self.metadata.num_blocks(), piece.to_vec()).await;
+                    } else {
+                        debug!("Rejected metadata {index}");
+                        peer.send_metadata_reject(index).await;
+                    }
+                }
             },
             MetadataMessage::Data { index, piece, total_size } => {
+                // TODO fix races here like for normal scheduling
                 if self.transfer.is_none() && !self.metadata.has_obtrined(index) {
-                    self.peers.get_mut(peer_id).map(|p| p.sub_sent_metadata_requests(1));
-                    if let Some(metadata_bytes) = self.metadata.place(index, piece) {
+                    debug!("Got metadata block {index}");
+                    let who_downloading = self.metadata.who_downloading(index);
+                    self.peers.entry(*peer_id).and_modify(
+                        |p| p.receive_metadata(who_downloading.map(|w| w == peer_id).unwrap_or(false))
+                    );
+                    if let Some(who) = who_downloading && who != peer_id {
+                        self.peers.get_mut(who).map(|p| p.sub_sent_metadata_requests(1));
+                    }
+
+                    if let Some(metadata_bytes) = self.metadata.place(index, piece, false) {
                         let metadata = Metadata::from_bytes(&metadata_bytes)
                             .map_err(|e| anyhow::anyhow!("Error parsing metadata: {e}"))?;
                         info!("Got metadata:\n{metadata}");
-                        self.transfer = Some(Transfer::new(metadata, self.tracker_tx.clone()).await?);
-                        if let Some(transfer) = &mut self.transfer {
-                            for (peer_id, peer) in self.peers.iter() {
-                                if let PeerState::Connected { tx, .. } = &peer.state {
-                                    transfer.add_connection(
-                                        peer_id.clone(), tx.clone(), peer.supports_fast
-                                    ).await?;
-                                }
+                        let mut transfer = Transfer::new(
+                            metadata,
+                            self.tracker_tx.clone(),
+                            self.progress_tx.clone(),
+                        ).await?;
+                        for (peer_id, peer) in self.peers.iter_mut() {
+                            if let PeerState::Connected { tx, initial_transfer_messages, .. } = &mut peer.state {
+                                transfer.add_connection(
+                                    peer_id.clone(),
+                                    tx.clone(),
+                                    peer.supports_fast,
+                                    Some(initial_transfer_messages),
+                                ).await?;
                             }
                         }
+                        self.transfer = Some(transfer);
                     } else {
                         self.dispatch_metadata_request().await?;
                     }
-                    debug!("Got metadata block {index}");
                 }
             },
             MetadataMessage::Reject { index } => {
                 if self.transfer.is_none() {
-                    self.metadata.reject(index, peer_id.clone());
-                    self.dispatch_metadata_request().await?;
+                    let who_downloading = self.metadata.who_downloading(index);
+                    if let Some(who) = who_downloading && who == peer_id {
+                        self.metadata.reject(index, peer_id.clone());
+                        self.peers.entry(*peer_id)
+                            .and_modify(|p| p.reject_metadata());
+                        self.dispatch_metadata_request().await?;
+                    }
                 }
                 debug!("Got metadata reject {index}");
             },
@@ -400,16 +485,25 @@ impl Torrent {
         }
         Ok(())
     }
-    
+
+    fn update_progress(&self) {
+        self.progress_tx.send_modify(|p| {
+            p.num_peers = self.peers.len();
+            p.num_connected_peers = self.peers.iter()
+                .filter(|p| p.1.state.is_connected()).count();
+            p.num_discovery_attempts = self.discovery_attemps.len();
+        });
+    }
+
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Message(peer_id, message) => {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     let span = tracing::info_span!(
-                        "connection",
+                        "peer",
                         id = %peer_id,
                     );
-                    let _enter = span.enter();
+                    let guard = span.enter();
                     // dispatch to transfer layer
                     match message {
                         Message::Metadata(msg) => self.handle_metadata_message(msg, &peer_id).await?,
@@ -418,11 +512,11 @@ impl Torrent {
 
                         Message::ExtensionHandshake { extensions, client, max_requests, metadata_size } => {
                             debug!("Got extension handshake {extensions:?} {client:?} {max_requests:?}");
-                            peer.client = client;
-                            peer.supports_metadataa |= extensions.contains_key("ut_metadata");
-                            peer.supports_pex |= extensions.contains_key("ut_pex");
-                            if let Some(metadata_size) = metadata_size && self.transfer.is_none() {
+                            peer.receive_extension_handshake(client, extensions);
+                            if let Some(metadata_size) = metadata_size && self.transfer.is_none() && metadata_size / (16 * 1024) > self.metadata.num_blocks() {
+                                warn!("Resetting metadata");
                                 self.metadata.set_length_and_reset(metadata_size);
+                                drop(guard);
                                 self.dispatch_metadata_request().await?;
                             }
                         }
@@ -446,6 +540,9 @@ impl Torrent {
                         msg @ _ => {
                             if let Some(transfer) = &mut self.transfer {
                                 transfer.handle_event(&peer_id, msg).await?;
+                            } else {
+                                self.peers.get_mut(&peer_id)
+                                    .map(|p| p.queue_transfer_message(msg));
                             }
                         }
                     }
@@ -457,7 +554,8 @@ impl Torrent {
 
                 if let Some(id) = known_id {
                     debug!(id = %id,"Reconnected");
-                    self.peers.get_mut(&id).unwrap().state.reconnect(tx.clone());
+                    self.peers.entry(id)
+                        .and_modify(|p| p.state.reconnect(tx.clone()));
                 } else {
                     self.discovery_attemps.retain(|a| a.info != info);
                     info.id = Some(bit_torrent.id);
@@ -473,7 +571,12 @@ impl Torrent {
                 }
 
                 if let Some(transfer) = &mut self.transfer {
-                    transfer.add_connection(info.id.unwrap(), tx, bit_torrent.supports_fast).await?;
+                    transfer.add_connection(
+                        info.id.unwrap(),
+                        tx,
+                        bit_torrent.supports_fast,
+                        None,
+                    ).await?;
                 }
                 tokio::task::Builder::new()
                     .name("BitTorrent")
@@ -497,8 +600,8 @@ impl Torrent {
                 if let Some(transfer) = &mut self.transfer {
                     transfer.sever_connection(&peer_id);
                 }
-                let peer = self.peers.get_mut(&peer_id).unwrap();
-                peer.state.disconnect(error);
+                self.peers.entry(peer_id)
+                    .and_modify(|p| p.state.disconnect(error));
             }
 
             Event::Tracker(peer_infos) => {
@@ -508,6 +611,8 @@ impl Torrent {
                 }
             }
         }
+
+        self.update_progress();
 
         Ok(())
     }

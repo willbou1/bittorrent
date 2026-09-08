@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fmt,
 };
-use tracing::debug;
+use tracing::{debug, level_filters::STATIC_MAX_LEVEL};
 
 use crate::{
     bitfield::Bitfield,
@@ -18,9 +18,12 @@ use crate::{
 
 const UPLOAD_LIMIT: usize = 32 * 1024; // b/s per peer
 
-const DEFAULT_MAX_REQUESTS: usize = 70;
-const MIN_MAX_REQUESTS: usize = 5;
-const MAX_MAX_REQUESTS: usize = 70;
+const TIMEOUTS_BOOST_ALPHA: f64 = 0.4;
+const TIMEOUTS_THROTTLE_ALPHA: f64 = 1.0;
+
+const DEFAULT_MAX_REQUESTS: usize = 2;
+const MIN_MAX_REQUESTS: usize = 1;
+const MAX_MAX_REQUESTS: usize = 200;
 const MAX_REQUESTS_STEP: usize = 2;
 
 pub struct Connection {
@@ -47,6 +50,8 @@ pub struct Connection {
     chokes_this_second: usize,
     rejects_this_second: usize,
     timeouts_this_second: usize,
+
+    timeouts_ema: f64,
 }
 
 impl Connection {
@@ -72,6 +77,8 @@ impl Connection {
             chokes_this_second: 0,
             rejects_this_second: 0,
             timeouts_this_second: 0,
+
+            timeouts_ema: 0.,
         }
     }
 
@@ -93,6 +100,17 @@ impl Connection {
     pub fn peer_choking(&self) -> bool {self.peer_choking}
     pub fn peer_interested(&self) -> bool {self.peer_interested}
     pub fn piece_bitfield(&self) -> &Bitfield {&self.piece_bitfield}
+
+    pub fn boost_max_requests(&mut self) {
+        self.max_requests = (self.max_requests + MAX_REQUESTS_STEP)
+            .min(MAX_MAX_REQUESTS);
+    }
+    pub fn throttle_max_requests(&mut self) {
+        self.max_requests = (self.max_requests * 3) / 4;
+        if self.max_requests == 0 {
+            self.max_requests = MIN_MAX_REQUESTS;
+        }
+    }
 
     pub fn sub_sent_requests(&mut self, count: usize) {
         self.sent_requests = self.sent_requests.saturating_sub(count);
@@ -187,7 +205,27 @@ impl Connection {
         }).await;
     }
 
+    fn control_congestion(&mut self) {
+        let alpha = if self.timeouts_this_second as f64 > self.timeouts_ema {
+            TIMEOUTS_BOOST_ALPHA
+        } else {
+            TIMEOUTS_THROTTLE_ALPHA
+        };
+        self.timeouts_ema = alpha * self.timeouts_this_second as f64
+            + (1. - alpha) * self.timeouts_ema;
+
+        if self.timeouts_ema >= 1. {
+            if !self.peer_choking {
+                self.throttle_max_requests();
+            }
+        } else if self.downloaded_this_second != 0 {
+            self.boost_max_requests();
+        }
+    }
+
     pub fn reset_stats(&mut self) {
+        self.control_congestion();
+
         self.uploaded_this_second = 0;
         self.downloaded_this_second = 0;
         self.num_response_times = 0;
@@ -200,7 +238,7 @@ impl Connection {
 
 impl fmt::Display for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#10} │ {} {} {:>4} {:>2} {:>2} {:>9}/s {:>8.2} {:>4} {:>4} {:>4} │ {} {} {:>9}/s",
+        write!(f, "{:#10} │ {} {} {:>4} {:>3} {:>3} {:>9}/s {:>8.2} {:>4} {:>4} {:>4} │ {} {} {:>9}/s",
             self.piece_bitfield(),
             if self.am_interested() {'■'} else {'□'},
             if self.peer_choking() {'■'} else {'□'},
@@ -219,3 +257,4 @@ impl fmt::Display for Connection {
         )
     }
 }
+

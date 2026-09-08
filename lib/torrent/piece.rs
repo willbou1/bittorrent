@@ -10,7 +10,6 @@ use crate::{
     bitfield::Bitfield, timer::Timer, types::*
 };
 
-const BLOCK_SIZE: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
 const REJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -56,23 +55,26 @@ pub struct Piece {
     written: bool,
     hash: Hash,
     length: usize,
+    block_size: usize,
     index: Option<usize>,
 }
 
 impl Piece {
     pub fn new(
         index: Option<usize>,
+        block_size: usize,
         length: usize,
         hash: Hash,
         written: bool,
     ) -> Self {
-        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let num_blocks = length.div_ceil(block_size);
         let mut blocks = vec![Block::default(); num_blocks];
         if written {
             blocks.fill(Block::new(BlockState::Written));
         }
 
         Self {
+            block_size,
             blocks,
             downloaded_blocks: 0,
             downloading_blocks: 0,
@@ -83,8 +85,29 @@ impl Piece {
         }
     }
 
+    pub fn from_slice(
+        block_size: usize,
+        hash: Hash,
+        data: &[u8],
+    ) -> Self {
+        let mut blocks = Vec::new();
+        for block in data.chunks_exact(block_size) {
+            blocks.push(Block::new(BlockState::Downloaded(block.to_vec())));
+        }
+        Self {
+            block_size,
+            blocks,
+            downloaded_blocks: 0,
+            downloading_blocks: 0,
+            written: false,
+            hash,
+            length: data.len(),
+            index: None,
+        }
+    }
+
     pub fn set_length_and_reset(&mut self, length: usize) {
-        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let num_blocks = length.div_ceil(self.block_size);
 
         self.downloaded_blocks = 0;
         self.downloading_blocks = 0;
@@ -146,6 +169,13 @@ impl Piece {
         matches!(self.blocks[index].state, BlockState::Downloaded(_) | BlockState::Written)
     }
 
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        match &self.blocks[index].state {
+            BlockState::Downloaded(data) => Some(data),
+            _ => None,
+        }
+    }
+
     pub fn find_available_block(&mut self, peer_id: &PeerId) -> Option<usize> {
         if !self.is_available() {
             return None;
@@ -199,7 +229,7 @@ impl Piece {
         }
     }
 
-    pub fn place(&mut self, index: usize, block: Vec<u8>) -> Option<Vec<u8>> {
+    pub fn place(&mut self, index: usize, block: Vec<u8>, write: bool) -> Option<Vec<u8>> {
         match &mut self.blocks[index].state {
             state @ BlockState::Downloading { .. } => {
                 *state = BlockState::Downloaded(block);
@@ -211,7 +241,6 @@ impl Piece {
 
         if self.is_downloaded() {
             if let Some(piece) = self.assemble() {
-                self.downloaded_blocks = 0;
                 self.downloading_blocks = 0;
                 let correct = self.verify(&piece);
                 if !correct {
@@ -219,8 +248,11 @@ impl Piece {
                     return None;
                 }
                 // TODO: we may wanna handle write error gracefully and signal to piece that we should write
-                self.blocks.fill(Block::new(BlockState::Written));
-                self.written = true;
+                if write {
+                    self.blocks.fill(Block::new(BlockState::Written));
+                    self.downloaded_blocks = 0;
+                    self.written = true;
+                }
                 return Some(piece);
             }
         }
@@ -282,7 +314,7 @@ impl Piece {
         for (b, block) in self.blocks.iter().enumerate() {
             match &block.state {
                 BlockState::Downloaded(block) => {
-                    let begin = BLOCK_SIZE * b;
+                    let begin = self.block_size * b;
                     piece[begin..begin + block.len()].copy_from_slice(&block);
                 }
                 _ => return None,

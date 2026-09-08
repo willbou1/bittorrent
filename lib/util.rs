@@ -30,15 +30,8 @@ pub fn pretty_duration(duration: Duration) -> String {
         if days > 0 {format!("{days}d ")} else {String::new()},
         if hours > 0 {format!("{hours}h ")} else {String::new()},
         if minutes > 0 {format!("{minutes}m ")} else {String::new()},
-        if secs > 0 {format!("{secs}s")} else {String::new()},
+        if secs > 0 && days == 0 && hours == 0 && minutes == 0 {
+            format!("{secs}s")} else {String::new()
+        },
     )
-}
-
-fn is_disconnection_boring(error: anyhow::Error) -> bool {
-    error.downcast_ref::<std::io::Error>()
-        .is_some_and(|e| matches!(e.kind(),
-            std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::BrokenPipe
-        ))
 }

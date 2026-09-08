@@ -41,6 +41,16 @@ impl Bitfield {
         self.buffer[index / 8] & Self::bit(index) != 0
     }
 
+    pub fn num_set(&self) -> usize {
+        let mut num = 0;
+        for b in 0..self.len() {
+            if self.has(b) {
+                num += 1;
+            }
+        }
+        num
+    }
+
     pub fn set(&mut self, index: usize) {
         self.buffer[index / 8] |= Self::bit(index);
     }

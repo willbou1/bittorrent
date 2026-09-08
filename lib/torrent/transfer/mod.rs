@@ -13,19 +13,21 @@ use std::{
     time::Duration,
     io::SeekFrom,
 };
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, trace};
 
 use crate::{
     bitfield::Bitfield,
-    metainfo::{Metadata},
+    metainfo::Metadata,
     proto::{
         bit_torrent::Message,
-        tracker::{Progress, Event},
+        tracker,
     },
-    util::*,
+    torrent::PieceProgress,
     types::*,
+    util::*
 };
 use super::piece::Piece;
+use super::control::*;
 use connection::Connection;
 use piece_cache::PieceCache;
 
@@ -35,7 +37,8 @@ fn block_index(begin: usize) -> usize {begin / BLOCK_SIZE}
 
 pub struct Transfer {
     metadata: Metadata,
-    tracker_tx: watch::Sender<Progress>,
+    tracker_tx: watch::Sender<tracker::Progress>,
+    progress_tx: watch::Sender<Progress>,
     pieces: Vec<Piece>,
     piece_bitfield: Bitfield,
     connections: HashMap<PeerId, Connection>,
@@ -46,14 +49,18 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    pub async fn new(metadata: Metadata, tracker_tx: watch::Sender<Progress>) -> Result<Self> {
+    pub async fn new(
+        metadata: Metadata,
+        tracker_tx: watch::Sender<tracker::Progress>,
+        progress_tx: watch::Sender<Progress>,
+    ) -> Result<Self> {
         let (pieces, downloaded_pieces, piece_bitfield) = Self::load_state(&metadata).await?;
         let downloaded = (downloaded_pieces * metadata.piece_length).min(metadata.length);
         let left = metadata.length - downloaded;
-        let _ = tracker_tx.send(Progress {
+        let _ = tracker_tx.send(tracker::Progress {
             downloaded,
             left,
-            event: Event::Started,
+            event: tracker::Event::Started,
             uploaded: 0,
         });
         Ok(Self {
@@ -61,6 +68,7 @@ impl Transfer {
             pieces,
             metadata,
             tracker_tx,
+            progress_tx,
             downloaded_pieces,
             piece_bitfield,
             connections: HashMap::new(),
@@ -77,6 +85,7 @@ impl Transfer {
             }
         }
         let path = Path::new("torrents").join(format!("{}.state", self.metadata.name));
+        fs::create_dir_all(&path.parent().unwrap()).await?;
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -91,6 +100,7 @@ impl Transfer {
         peer_id: PeerId,
         tx: mpsc::Sender<Message>,
         supports_fast: bool,
+        initial_messages: Option<&mut VecDeque<Message>>,
     ) -> Result<()> {
         let mut con = Connection::new(peer_id, tx, self.metadata.num_pieces, supports_fast);
         if self.downloaded_pieces == 0 && supports_fast {
@@ -102,6 +112,13 @@ impl Transfer {
         }
         con.set_am_interested(true).await;
         self.connections.insert(peer_id, con);
+
+        if let Some(initial_messages) = initial_messages {
+            for msg in initial_messages.drain(..) {
+                trace!("Read initial transfer message {msg:?}");
+                self.handle_event(&peer_id, msg).await?;
+            }
+        }
         Ok(())
     }
 
@@ -116,7 +133,7 @@ impl Transfer {
         self.check_request_accounting("Before timeouts");
         for piece in self.pieces.iter_mut() {
             for (peer_id, count) in piece.check_timeout() {
-                self.connections.get_mut(&peer_id) .map(|c| c.timeout(count));
+                self.connections.entry(peer_id).and_modify(|c| c.timeout(count));
             }
         }
         self.check_request_accounting("After timeouts");
@@ -157,6 +174,11 @@ impl Transfer {
         peer_id: &PeerId,
         message: Message
     ) -> Result<()> {
+        let span = tracing::info_span!(
+            "connection",
+            id = %peer_id,
+        );
+        let guard = span.enter();
         match message {
             Message::Bitfield(bitfield) => {
                 debug!("Set bitfield {:?}", bitfield.as_bytes());
@@ -168,7 +190,7 @@ impl Transfer {
             Message::Have { index } => {
                 debug!("Got have {index}");
                 self.check_piece_index(index, "have")?;
-                self.connections.get_mut(peer_id).map(|c| c.set_piece(index));
+                self.connections.entry(*peer_id).and_modify(|c| c.set_piece(index));
             }
 
             Message::Request { index, begin, length } => {
@@ -203,17 +225,18 @@ impl Transfer {
                 if !self.pieces[index].has_obtrined(block_index) {
                     debug!("Got block {index}:{block_index}");
                     let who_downloading = self.pieces[index].who_downloading(block_index);
-                    self.connections.get_mut(peer_id)
-                        .map(|c| c.receive_piece(
+                    self.connections.entry(*peer_id).and_modify(
+                        |c| c.receive_piece(
                             block.len(),
                             response_time,
-                            who_downloading.map(|w| w == peer_id).unwrap_or(false)));
+                            who_downloading.map(|w| w == peer_id).unwrap_or(false))
+                    );
 
                     if let Some(who) = who_downloading && who != peer_id {
                         self.connections.get_mut(who).map(|c| c.sub_sent_requests(1));
                     }
 
-                    if let Some(piece) = self.pieces[index].place(block_index, block) {
+                    if let Some(piece) = self.pieces[index].place(block_index, block, true) {
                         self.write_piece(index, &piece).await?;
                         self.piece_bitfield.set(index);
                         self.downloaded_pieces += 1;
@@ -221,10 +244,10 @@ impl Transfer {
                             con.send(Message::Have {index}).await;
                         }
                         let (downloaded, left) = self.downloaded_left();
-                        let _ = self.tracker_tx.send(Progress {
+                        let _ = self.tracker_tx.send(tracker::Progress {
                             downloaded,
                             left,
-                            event: Event::Started,
+                            event: tracker::Event::Started,
                             uploaded: self.uploaded,
                         });
                     }
@@ -258,17 +281,17 @@ impl Transfer {
                 // TODO implement BEP semantics properly
                 let who_downloading = self.pieces[index].who_downloading(block_index);
                 if let Some(who) = who_downloading && who == peer_id {
-                    self.connections.get_mut(peer_id).map(|c| c.reject());
+                    self.connections.entry(*peer_id).and_modify(|c| c.reject());
                     self.pieces[index].reject(block_index, peer_id.clone());
                 }
             }
             Message::HaveAll => {
                 debug!("Got have all");
-                self.connections.get_mut(peer_id).map(|c| c.set_pieces());
+                self.connections.entry(*peer_id).and_modify(|c| c.set_pieces());
             },
             Message::HaveNone => {
                 debug!("Got have none");
-                self.connections.get_mut(peer_id).map(|c| c.unset_pieces());
+                self.connections.entry(*peer_id).and_modify(|c| c.unset_pieces());
             },
             Message::Suggest { index } => {
                 debug!("Got suggest for block {index}");
@@ -279,6 +302,7 @@ impl Transfer {
         }
 
         self.check_request_accounting("Before dispatch");
+        drop(guard);
         self.dispatch_requests().await?;
         self.check_request_accounting("After dispatch");
 
@@ -305,11 +329,11 @@ impl Transfer {
                 if written {
                     downloaded_pieces += 1;
                 }
-                pieces.push(Piece::new(Some(p), metadata.piece_length(p), metadata.pieces[p], written));
+                pieces.push(Piece::new(Some(p), BLOCK_SIZE, metadata.piece_length(p), metadata.pieces[p], written));
             }
         } else {
             for p in 0..metadata.num_pieces {
-                pieces.push(Piece::new(Some(p), metadata.piece_length(p), metadata.pieces[p], false));
+                pieces.push(Piece::new(Some(p), BLOCK_SIZE, metadata.piece_length(p), metadata.pieces[p], false));
             }
         }
         Ok((pieces, downloaded_pieces, bitfield))
@@ -408,7 +432,8 @@ impl Transfer {
             while self.connections[&peer_id].can_request() {
                 match self.find_or_keep_piece(&self.connections[&peer_id]) {
                     Some(cursor) => {
-                        self.connections.get_mut(&peer_id).unwrap().piece_cursor = Some(cursor);
+                        self.connections.entry(peer_id)
+                            .and_modify(|p| p.piece_cursor = Some(cursor));
                         if let Some(b) = self.pieces[cursor].find_available_block(&peer_id) {
                             self.request_block(&peer_id, cursor, b).await?;
                             self.pieces[cursor].download(b, peer_id);
@@ -433,26 +458,15 @@ impl Transfer {
         (downloaded, left)
     }
 
-    fn eta(&self, downloaded_this_second: usize) -> Duration {
-        let (_, left) = self.downloaded_left();
-        Duration::from_secs(
-            if downloaded_this_second == 0 {
-                0
-            } else {
-                (left / downloaded_this_second) as u64
-            }
-        )
-    }
-
     fn statistics(&mut self) {
         let mut downloaded_this_second = 0;
         let mut uploaded_this_second = 0;
         let mut timeouts_this_second = 0;
 
         let mut connections = String::new();
-        connections.push_str(&format!("{:<56}│{:<52}│{}\n", "", " Download", " Upload"));
+        connections.push_str(&format!("{:<56}│{:<54}│{}\n", "", " Download", " Upload"));
         connections.push_str(
-            &format!("{:<56}│ I C {:>4} {:>2} {:>2} {:>9}/s {:>8} {:>4} {:>4} {:>4} │ I C {:>9}/s\n",
+            &format!("{:<56}│ I C {:>4} {:>3} {:>3} {:>9}/s {:>8} {:>4} {:>4} {:>4} │ I C {:>9}/s\n",
                 "", "PC", "PL", "RQ", "", "Time", "t/s", "c/s", "r/s", "")
         );
         for (peer_id, con) in self.connections.iter_mut() {
@@ -463,47 +477,30 @@ impl Transfer {
             con.reset_stats();
         }
         connections.push_str(
-            &format!("{:>56}│     {:>4} {:>2} {:>2} {:>9}/s {:>8} {:>4} {:>4} {:>4} │     {:>9}/s\n",
+            &format!("{:>56}│     {:>4} {:>3} {:>3} {:>9}/s {:>8} {:>4} {:>4} {:>4} │     {:>9}/s\n",
                 format!("Total ({}) ", self.connections.len()),
                 "", "", "", pretty_size(downloaded_this_second), "", timeouts_this_second, "", "", pretty_size(uploaded_this_second))
         );
-
-        let mut blocks = String::new();
-        let active_pieces: Vec<_> = self.pieces.iter().enumerate()
-            .filter(|(_, p)| p.is_active()).collect();
-        let mut i = 0;
-        for (p, piece) in &active_pieces {
-            blocks.push_str(&format!("{:<4} {:30} {:>5.2}% {:>11}",
-                p,
-                piece.to_bitfield(),
-                piece.obtained_blocks() as f64 * 100. / piece.num_blocks() as f64,
-                format!("({}/{})", piece.obtained_blocks(), piece.num_blocks()),
-            ));
-            i += 1;
-            blocks.push_str(
-                if i % 2 == 0 || i == active_pieces.len() {"\n"}
-                else {"   │   "}
-            );
-        }
-
-        let mut pieces_bitfield = Bitfield::new(self.pieces.len());
-        for (p, piece) in self.pieces.iter().enumerate() {
-            if piece.is_written() {
-                pieces_bitfield.set(p);
-            }
-        }
-
-        info!("\n{}{}{:90} {:.2}% ({}/{}) ETA {}",
-            connections,
-            blocks,
-
-            pieces_bitfield,
-            self.downloaded_pieces as f64 * 100. / self.pieces.len() as f64,
-            self.downloaded_pieces, self.pieces.len(),
-            pretty_duration(self.eta(downloaded_this_second)),
-        );
+        info!("\n{}", connections,);
 
         self.uploaded += uploaded_this_second;
+        self.progress_tx.send_modify(|p| p.transfer = Some(TransferProgress {
+            size: self.metadata.length,
+            down_speed: downloaded_this_second,
+            up_speed: uploaded_this_second,
+            downloaded: self.downloaded_left().0,
+            uploaded: self.uploaded,
+            piece_bitfield: self.piece_bitfield.clone(),
+            active_pieces: self.pieces.iter().enumerate()
+                .filter(|(_, p)| p.is_active())
+                .map(|(p, piece)| PieceProgress {
+                    index: p,
+                    block_bitfield: piece.to_bitfield(),
+                    num_blocks: piece.num_blocks(),
+                    num_obtained_blocks: piece.obtained_blocks(),
+                })
+                .collect(),
+        }));
     }
 
     fn check_piece_index(&self, index: usize, op: &str) -> Result<()> {
