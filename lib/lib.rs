@@ -2,7 +2,6 @@ mod metainfo;
 mod tracker;
 mod proto;
 mod timer;
-mod table;
 
 pub mod types;
 pub mod bitfield;
