@@ -8,6 +8,11 @@ use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
+use crossterm::{
+    execute,
+    cursor::MoveTo,
+    terminal::{Clear, ClearType, self},
+};
 
 use libvictoria::{
     torrent::{Torrent, control::*},
@@ -22,11 +27,15 @@ impl Row for Progress {
             Column {
                 header: "",
                 alignment: Alignment::Left,
+                max_width: None,
+                flex: None,
                 total: None,
             },
             Column {
                 header: "Con",
                 alignment: Alignment::Right,
+                max_width: None,
+                flex: None,
                 total: Some(|rows| {
                     let total: usize = rows.iter()
                         .map(|r| r.num_connected_peers).sum();
@@ -36,6 +45,8 @@ impl Row for Progress {
             Column {
                 header: "Dis",
                 alignment: Alignment::Right,
+                max_width: None,
+                flex: None,
                 total: Some(|rows| {
                     let total: usize = rows.iter()
                         .map(|r| r.num_discovery_attempts).sum();
@@ -45,35 +56,50 @@ impl Row for Progress {
             Column {
                 header: "Down",
                 alignment: Alignment::Right,
+                max_width: None,
+                flex: None,
                 total: Some(|rows| {
                     let total: usize = rows.iter()
                         .map(|r| r.transfer.as_ref().map_or(0, |t| t.down_speed)).sum();
-                    format!("{total}")
+                    format!("{}", pretty_size(total))
                 }),
             },
             Column {
                 header: "Up",
                 alignment: Alignment::Right,
+                max_width: None,
+                flex: None,
                 total: Some(|rows| {
                     let total: usize = rows.iter()
                         .map(|r| r.transfer.as_ref().map_or(0, |t| t.up_speed)).sum();
-                    format!("{total}")
+                    format!("{}", pretty_size(total))
                 }),
-            },
-            Column {
-                header: "%",
-                alignment: Alignment::Right,
-                total: None,
             },
             Column {
                 header: "Name",
                 alignment: Alignment::Left,
+                max_width: None,
+                flex: Some(2),
+                total: None,
+            },
+            Column {
+                header: "Piece bitfield",
+                alignment: Alignment::Left,
+                max_width: None,
+                flex: Some(1),
+                total: None,
+            },
+            Column {
+                header: "%",
+                alignment: Alignment::Right,
+                max_width: None,
+                flex: None,
                 total: None,
             },
         ]
     }
 
-    fn display(&self, index: usize, length: Option<usize>) -> String {
+    fn display_column(&self, index: usize, width: Option<usize>) -> String {
         match index {
             0 => {
                 if let Some(bitfield) = &self.metadata_bitfield
@@ -95,14 +121,23 @@ impl Row for Progress {
                 .as_ref()
                 .map(|t| pretty_size(t.up_speed))
                 .unwrap_or_default().to_string(),
-            5 => format!(
-                "{:.2}%",
+            5 => {
+                if let Some(width) = width {
+                    self.display_name.chars().take(width - 1).chain(['…']).collect()
+                } else {
+                    self.display_name.to_string()
+                }
+            },
+            6 => self.transfer.as_ref().map(
+                |t| format!("{:WIDTH$}", t.piece_bitfield, WIDTH = width.unwrap())
+            ).unwrap_or(String::new()),
+            7 => format!(
+                "{:.2}",
                 self.transfer
                     .as_ref()
                     .map(|t| t.downloaded as f64 * 100. / t.size as f64)
                     .unwrap_or(0.)
             ),
-            7 => self.display_name.to_string(),
             _ => unreachable!(),
         }
     }
@@ -142,37 +177,48 @@ pub async fn run_torrents(torrent_uris: &[String]) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let ctrl_c = signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let table = Table::<Progress>::new(2);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let mut frame = String::new();
+                let rows: Vec<Progress> = torrent_tasks
+                .iter()
+                .map(|tt| tt.rx.borrow().clone())
+                .collect();
+                let frame = table.render(&rows, terminal::size()?.0.into());
 
-                for torrent_task in &torrent_tasks {
-                    let progress = torrent_task.rx.borrow();
 
-                    frame.push_str(&format!(
-                        "{}\n",
-                        progress.display(0, None),
-                    ));
+                //for torrent_task in &torrent_tasks {
+                //    let progress = torrent_task.rx.borrow();
 
-                    if let Some(transfer) = &progress.transfer {
-                        let mut i = 0;
-                        for piece in &transfer.active_pieces {
-                            frame.push_str(&format!("{:<4} {:30} {:>5.2}% {:>11}",
-                                piece.index,
-                                piece.block_bitfield,
-                                piece.num_obtained_blocks as f64 * 100. / piece.num_blocks as f64,
-                                format!("({}/{})", piece.num_obtained_blocks, piece.num_blocks),
-                            ));
-                            i += 1;
-                            frame.push_str(&format!("{}",
-                                if i % 2 == 0 || i == transfer.active_pieces.len() {"\n"}
-                                else {"   │   "}
-                            ));
-                        }
-                    }
-                }
-                print!("\x1B[2J\x1B[H{frame}");
+                //    frame.push_str(&format!(
+                //        "{}\n",
+                //        progress.display_column(0, None),
+                //    ));
+
+                //    if let Some(transfer) = &progress.transfer {
+                //        let mut i = 0;
+                //        for piece in &transfer.active_pieces {
+                //            frame.push_str(&format!("{:<4} {:30} {:>5.2}% {:>11}",
+                //                piece.index,
+                //                piece.block_bitfield,
+                //                piece.num_obtained_blocks as f64 * 100. / piece.num_blocks as f64,
+                //                format!("({}/{})", piece.num_obtained_blocks, piece.num_blocks),
+                //            ));
+                //            i += 1;
+                //            frame.push_str(&format!("{}",
+                //                if i % 2 == 0 || i == transfer.active_pieces.len() {"\n"}
+                //                else {"   │   "}
+                //            ));
+                //        }
+                //    }
+                //}
+                execute!(
+                    std::io::stdout(),
+                    Clear(ClearType::All),
+                    MoveTo(0, 0),
+                )?;
+                print!("{frame}");
             }
 
             _ = &mut ctrl_c => {

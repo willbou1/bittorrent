@@ -3,6 +3,7 @@ use crate::{
     bitfield::Bitfield,
 };
 
+#[derive(Clone)]
 pub struct PieceProgress {
     pub index: usize,
     pub num_blocks: usize,
@@ -10,6 +11,7 @@ pub struct PieceProgress {
     pub block_bitfield: Bitfield,
 }
 
+#[derive(Clone)]
 pub struct TransferProgress {
     pub down_speed: usize,
     pub up_speed: usize,
@@ -20,6 +22,7 @@ pub struct TransferProgress {
     pub active_pieces: Vec<PieceProgress>,
 }
 
+#[derive(Clone)]
 pub struct Progress {
     pub num_discovery_attempts: usize,
     pub num_peers: usize,

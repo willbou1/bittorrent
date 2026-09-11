@@ -73,10 +73,7 @@ impl Bitfield {
 impl fmt::Display for Bitfield {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const BRAILLE_BITS: [u8; 8] = [0, 1, 2, 6, 3, 4, 5, 7];
-
         let num_cols = f.width().unwrap_or(0);
-        write!(f, "[ ")?;
-
         let mut bits = 0u8;
         let chunks = num_cols * 8;
         let len = self.len();
@@ -103,8 +100,6 @@ impl fmt::Display for Bitfield {
                 bits = 0;
             }
         }
-
-        write!(f, " ]")?;
         Ok(())
     }
 }
